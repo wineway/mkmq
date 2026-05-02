@@ -10,6 +10,7 @@
 #include <seastar/core/internal/estimated_histogram.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/metrics_registration.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
@@ -108,6 +109,7 @@ private:
     std::filesystem::path index_path() const;
     seastar::future<> recover();
     seastar::future<bool> recover_from_index();
+    seastar::future<bool> recovered_index_covers_segments();
     seastar::future<> recover_from_segments();
     seastar::future<std::vector<std::pair<std::int64_t, std::filesystem::path>>> list_segment_files();
     seastar::future<> recover_segment_file(
@@ -119,12 +121,14 @@ private:
     seastar::future<> open_index();
     seastar::future<> ensure_segment_for_write(std::int64_t base_offset, std::uint64_t frame_size);
     seastar::future<> write_record_set(const RecordSet& record_set);
-    seastar::future<> write_index_entry(
+    void schedule_index_entry_write(
         std::int64_t base_offset,
         std::int64_t last_offset,
         std::int32_t record_bytes,
         std::int64_t segment_base,
         std::uint64_t segment_position);
+    seastar::future<> write_index_entry_at(const IndexEntry& entry, std::uint64_t position);
+    seastar::future<> wait_for_index_writes();
     seastar::future<std::optional<IndexEntry>> read_index_entry(std::uint64_t position);
     seastar::future<std::uint64_t> find_index_position_for_offset(std::int64_t offset);
     seastar::future<std::vector<std::uint8_t>> read_segment_record(const IndexEntry& entry);
@@ -136,11 +140,12 @@ private:
         seastar::file& index_file,
         const IndexEntry& entry,
         std::uint64_t position);
+    void update_dma_alignment(const seastar::file& file) noexcept;
     void note_index_entry(const IndexEntry& entry);
     seastar::future<> maybe_flush();
     static std::int64_t estimate_record_count(const std::vector<std::uint8_t>& records);
     static std::optional<IndexEntry> decode_index_entry(const std::uint8_t* bytes);
-    static void encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry);
+    void encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry) const;
 
     PartitionConfig config_;
     std::filesystem::path root_;
@@ -150,11 +155,16 @@ private:
     std::uint32_t queue_depth_{0};
     std::int64_t active_segment_base_offset_{0};
     std::uint64_t write_position_{0};
+    std::uint64_t log_frame_alignment_{4096};
+    std::uint64_t index_entry_size_{4096};
+    std::uint64_t memory_dma_alignment_{4096};
     bool degraded_{false};
     std::int64_t replica_lag_{0};
     std::optional<seastar::file> file_;
     std::optional<seastar::file> index_file_;
     std::uint64_t index_position_{0};
+    seastar::shared_future<> index_write_tail_;
+    std::exception_ptr index_write_error_;
     std::uint64_t disk_writes_{0};
     std::uint64_t disk_fsyncs_{0};
     LatencyHistogram disk_write_latency_;

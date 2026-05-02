@@ -26,10 +26,9 @@
 namespace mkmq {
 namespace {
 
-constexpr std::uint64_t kLogFrameAlignment = 4096;
 constexpr char kLogMagic[8] = {'M', 'K', 'M', 'Q', 'L', 'O', 'G', '1'};
 constexpr char kIndexMagic[8] = {'M', 'K', 'M', 'Q', 'I', 'D', 'X', '1'};
-constexpr std::uint64_t kIndexEntrySize = 4096;
+constexpr std::uint64_t kIndexEntryPayloadSize = 48;
 constexpr std::int32_t kReplicaCatchupMaxBytes = 1024 * 1024;
 
 std::uint64_t round_up(std::uint64_t value, std::uint64_t alignment) {
@@ -270,6 +269,8 @@ seastar::future<> PartitionLogShard::start(
     config_ = std::move(config);
     root_ = std::move(root);
     segment_bytes_ = segment_bytes;
+    index_write_tail_ = seastar::shared_future<>(seastar::make_ready_future<>());
+    index_write_error_ = nullptr;
     return seastar::recursive_touch_directory(root_.string()).then([this] {
         return recover();
     }).then([this] {
@@ -279,19 +280,27 @@ seastar::future<> PartitionLogShard::start(
     });
 }
 
+void PartitionLogShard::update_dma_alignment(const seastar::file& file) noexcept {
+    log_frame_alignment_ = std::max<std::uint64_t>(1, file.disk_write_dma_alignment());
+    index_entry_size_ = round_up(kIndexEntryPayloadSize, log_frame_alignment_);
+    memory_dma_alignment_ = std::max<std::uint64_t>(1, file.memory_dma_alignment());
+}
+
 seastar::future<> PartitionLogShard::stop() {
-    std::vector<seastar::future<>> closes;
-    if (file_.has_value()) {
-        auto file = std::move(*file_);
-        file_.reset();
-        closes.push_back(file.close());
-    }
-    if (index_file_.has_value()) {
-        auto file = std::move(*index_file_);
-        index_file_.reset();
-        closes.push_back(file.close());
-    }
-    return seastar::when_all_succeed(closes.begin(), closes.end()).discard_result();
+    return wait_for_index_writes().finally([this] {
+        std::vector<seastar::future<>> closes;
+        if (file_.has_value()) {
+            auto file = std::move(*file_);
+            file_.reset();
+            closes.push_back(file.close());
+        }
+        if (index_file_.has_value()) {
+            auto file = std::move(*index_file_);
+            index_file_.reset();
+            closes.push_back(file.close());
+        }
+        return seastar::when_all_succeed(closes.begin(), closes.end()).discard_result();
+    });
 }
 
 const PartitionConfig& PartitionLogShard::config() const noexcept {
@@ -495,7 +504,17 @@ seastar::future<> PartitionLogShard::recover() {
 
     return recover_from_index().then([this](bool recovered) {
         if (recovered) {
-            return seastar::make_ready_future<>();
+            return recovered_index_covers_segments().then([this](bool complete) {
+                if (complete) {
+                    return seastar::make_ready_future<>();
+                }
+                segments_.clear();
+                offsets_ = {};
+                active_segment_base_offset_ = 0;
+                write_position_ = 0;
+                index_position_ = 0;
+                return recover_from_segments();
+            });
         }
         return recover_from_segments();
     });
@@ -505,6 +524,7 @@ seastar::future<bool> PartitionLogShard::recover_from_index() {
     seastar::file index;
     try {
         index = co_await seastar::open_file_dma(index_path().string(), seastar::open_flags::ro);
+        update_dma_alignment(index);
     } catch (...) {
         co_return false;
     }
@@ -513,10 +533,10 @@ seastar::future<bool> PartitionLogShard::recover_from_index() {
     std::exception_ptr error;
     try {
         const auto size = co_await index.size();
-        for (std::uint64_t position = 0; position + kIndexEntrySize <= size; position += kIndexEntrySize) {
-            auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(kIndexEntrySize, kLogFrameAlignment);
-            const auto bytes_read = co_await index.dma_read(position, buffer.get(), kIndexEntrySize);
-            if (bytes_read != kIndexEntrySize) {
+        for (std::uint64_t position = 0; position + index_entry_size_ <= size; position += index_entry_size_) {
+            auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(index_entry_size_, memory_dma_alignment_);
+            const auto bytes_read = co_await index.dma_read(position, buffer.get(), index_entry_size_);
+            if (bytes_read != index_entry_size_) {
                 break;
             }
             auto entry = decode_index_entry(buffer.get());
@@ -526,7 +546,7 @@ seastar::future<bool> PartitionLogShard::recover_from_index() {
             note_index_entry(*entry);
             offsets_.latest = std::max(offsets_.latest, entry->last_offset + 1);
             offsets_.high_watermark = offsets_.latest;
-            index_position_ += kIndexEntrySize;
+            index_position_ += index_entry_size_;
             recovered = true;
         }
     } catch (...) {
@@ -543,6 +563,32 @@ seastar::future<bool> PartitionLogShard::recover_from_index() {
         write_position_ = active.write_position;
     }
     co_return recovered;
+}
+
+seastar::future<bool> PartitionLogShard::recovered_index_covers_segments() {
+    if (segments_.empty()) {
+        co_return true;
+    }
+
+    const auto segment_files = co_await list_segment_files();
+    if (segment_files.size() != segments_.size()) {
+        co_return false;
+    }
+
+    for (std::size_t i = 0; i < segment_files.size(); ++i) {
+        const auto& [segment_base, path] = segment_files[i];
+        if (segment_base != segments_[i].base_offset) {
+            co_return false;
+        }
+        seastar::file segment = co_await seastar::open_file_dma(path.string(), seastar::open_flags::ro);
+        const auto size = co_await segment.size();
+        co_await segment.close();
+        if (size != segments_[i].write_position) {
+            co_return false;
+        }
+    }
+
+    co_return true;
 }
 
 seastar::future<> PartitionLogShard::recover_from_segments() {
@@ -616,14 +662,15 @@ seastar::future<> PartitionLogShard::recover_segment_file(
     seastar::file& rebuilt_index,
     std::uint64_t& rebuilt_index_position) {
     seastar::file segment = co_await seastar::open_file_dma(path.string(), seastar::open_flags::ro);
+    update_dma_alignment(segment);
     std::exception_ptr error;
     try {
         const auto size = co_await segment.size();
         std::uint64_t position = 0;
-        while (position + kLogFrameAlignment <= size) {
-            auto header_buffer = seastar::allocate_aligned_buffer<std::uint8_t>(kLogFrameAlignment, kLogFrameAlignment);
-            const auto header_bytes = co_await segment.dma_read(position, header_buffer.get(), kLogFrameAlignment);
-            if (header_bytes != kLogFrameAlignment ||
+        while (position + log_frame_alignment_ <= size) {
+            auto header_buffer = seastar::allocate_aligned_buffer<std::uint8_t>(log_frame_alignment_, memory_dma_alignment_);
+            const auto header_bytes = co_await segment.dma_read(position, header_buffer.get(), log_frame_alignment_);
+            if (header_bytes != log_frame_alignment_ ||
                 std::memcmp(header_buffer.get(), kLogMagic, sizeof(kLogMagic)) != 0) {
                 break;
             }
@@ -633,16 +680,16 @@ seastar::future<> PartitionLogShard::recover_segment_file(
             if (record_bytes <= 0) {
                 break;
             }
-            const auto frame_size = round_up(20 + static_cast<std::uint64_t>(record_bytes), kLogFrameAlignment);
+            const auto frame_size = round_up(20 + static_cast<std::uint64_t>(record_bytes), log_frame_alignment_);
             if (position + frame_size > size) {
                 break;
             }
 
             std::vector<std::uint8_t> records(static_cast<std::size_t>(record_bytes));
-            if (frame_size == kLogFrameAlignment) {
+            if (frame_size == log_frame_alignment_) {
                 std::memcpy(records.data(), header_buffer.get() + 20, records.size());
             } else {
-                auto frame_buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, kLogFrameAlignment);
+                auto frame_buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, memory_dma_alignment_);
                 const auto frame_bytes = co_await segment.dma_read(position, frame_buffer.get(), frame_size);
                 if (frame_bytes != frame_size ||
                     std::memcmp(frame_buffer.get(), kLogMagic, sizeof(kLogMagic)) != 0 ||
@@ -663,8 +710,8 @@ seastar::future<> PartitionLogShard::recover_segment_file(
             };
             note_index_entry(index_entry);
             co_await write_rebuilt_index_entry(rebuilt_index, index_entry, rebuilt_index_position);
-            rebuilt_index_position += kIndexEntrySize;
-            index_position_ += kIndexEntrySize;
+            rebuilt_index_position += index_entry_size_;
+            index_position_ += index_entry_size_;
             offsets_.latest = base_offset + count;
             offsets_.high_watermark = offsets_.latest;
             position += frame_size;
@@ -687,6 +734,7 @@ seastar::future<> PartitionLogShard::open_active_segment() {
         segment_path(active_segment_base_offset_).string(),
         seastar::open_flags::rw | seastar::open_flags::create,
         options).then([this](seastar::file file) {
+            update_dma_alignment(file);
             file_.emplace(std::move(file));
         });
 }
@@ -698,6 +746,7 @@ seastar::future<> PartitionLogShard::open_index() {
         index_path().string(),
         seastar::open_flags::rw | seastar::open_flags::create,
         options).then([this](seastar::file file) {
+            update_dma_alignment(file);
             index_file_.emplace(std::move(file));
         });
 }
@@ -723,8 +772,8 @@ seastar::future<> PartitionLogShard::ensure_segment_for_write(std::int64_t base_
 seastar::future<> PartitionLogShard::write_record_set(const RecordSet& record_set) {
     const auto started = std::chrono::steady_clock::now();
     const std::uint64_t header_size = 20;
-    const std::uint64_t frame_size = round_up(header_size + record_set.bytes.size(), kLogFrameAlignment);
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, kLogFrameAlignment);
+    const std::uint64_t frame_size = round_up(header_size + record_set.bytes.size(), log_frame_alignment_);
+    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, memory_dma_alignment_);
     std::memset(buffer.get(), 0, frame_size);
     std::memcpy(buffer.get(), kLogMagic, sizeof(kLogMagic));
     put_i64(buffer.get() + 8, record_set.base_offset);
@@ -759,30 +808,54 @@ seastar::future<> PartitionLogShard::write_record_set(const RecordSet& record_se
                  buffer = std::move(buffer)](std::size_t) mutable {
                     ++disk_writes_;
                     disk_write_latency_.add(std::chrono::steady_clock::now() - started);
-                    return write_index_entry(base_offset, last_offset, record_bytes, segment_base, position);
+                    schedule_index_entry_write(base_offset, last_offset, record_bytes, segment_base, position);
+                    return seastar::make_ready_future<>();
                 });
         });
 }
 
-seastar::future<> PartitionLogShard::write_index_entry(
+void PartitionLogShard::schedule_index_entry_write(
     std::int64_t base_offset,
     std::int64_t last_offset,
     std::int32_t record_bytes,
     std::int64_t segment_base,
     std::uint64_t segment_position) {
     if (!index_file_.has_value()) {
+        index_write_error_ = std::make_exception_ptr(std::runtime_error("partition index file is not open"));
+        return;
+    }
+    IndexEntry entry{base_offset, last_offset, segment_base, segment_position, record_bytes};
+    const auto position = index_position_;
+    index_position_ += index_entry_size_;
+    note_index_entry(entry);
+    auto previous = index_write_tail_;
+    index_write_tail_ = seastar::shared_future<>(
+        previous.get_future().then([this, entry, position] {
+            return write_index_entry_at(entry, position);
+        }).handle_exception([this](std::exception_ptr error) {
+            index_write_error_ = error;
+            return seastar::make_exception_future<>(error);
+        }));
+}
+
+seastar::future<> PartitionLogShard::write_index_entry_at(const IndexEntry& entry, std::uint64_t position) {
+    if (!index_file_.has_value()) {
         return seastar::make_exception_future<>(std::runtime_error("partition index file is not open"));
     }
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(kIndexEntrySize, kLogFrameAlignment);
-    IndexEntry entry{base_offset, last_offset, segment_base, segment_position, record_bytes};
+    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(index_entry_size_, memory_dma_alignment_);
     encode_index_entry(buffer.get(), entry);
-    const auto position = index_position_;
-    index_position_ += kIndexEntrySize;
     auto raw = buffer.get();
-    return index_file_->dma_write(position, raw, kIndexEntrySize).then(
-        [this, entry, buffer = std::move(buffer)](std::size_t) mutable {
-            note_index_entry(entry);
-        });
+    return index_file_->dma_write(position, raw, index_entry_size_).then(
+        [buffer = std::move(buffer)](std::size_t) mutable {});
+}
+
+seastar::future<> PartitionLogShard::wait_for_index_writes() {
+    return index_write_tail_.get_future().then([this] {
+        if (index_write_error_) {
+            return seastar::make_exception_future<>(index_write_error_);
+        }
+        return seastar::make_ready_future<>();
+    });
 }
 
 seastar::future<std::optional<PartitionLogShard::IndexEntry>> PartitionLogShard::read_index_entry(
@@ -790,11 +863,12 @@ seastar::future<std::optional<PartitionLogShard::IndexEntry>> PartitionLogShard:
     if (!index_file_.has_value() || position >= index_position_) {
         return seastar::make_ready_future<std::optional<IndexEntry>>(std::nullopt);
     }
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(kIndexEntrySize, kLogFrameAlignment);
+    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(index_entry_size_, memory_dma_alignment_);
+    const auto entry_size = index_entry_size_;
     auto raw = buffer.get();
-    return index_file_->dma_read(position, raw, kIndexEntrySize).then(
-        [buffer = std::move(buffer)](std::size_t bytes_read) mutable {
-            if (bytes_read != kIndexEntrySize) {
+    return index_file_->dma_read(position, raw, entry_size).then(
+        [entry_size, buffer = std::move(buffer)](std::size_t bytes_read) mutable {
+            if (bytes_read != entry_size) {
                 return seastar::make_ready_future<std::optional<IndexEntry>>(std::nullopt);
             }
             return seastar::make_ready_future<std::optional<IndexEntry>>(decode_index_entry(buffer.get()));
@@ -802,18 +876,19 @@ seastar::future<std::optional<PartitionLogShard::IndexEntry>> PartitionLogShard:
 }
 
 seastar::future<std::uint64_t> PartitionLogShard::find_index_position_for_offset(std::int64_t offset) {
-    const auto entry_count = index_position_ / kIndexEntrySize;
+    const auto entry_count = index_position_ / index_entry_size_;
+    const auto entry_size = index_entry_size_;
     return seastar::do_with(
         std::uint64_t{0},
         entry_count,
         entry_count,
-        [this, offset](std::uint64_t& low, std::uint64_t& high, std::uint64_t& candidate) {
-            return seastar::repeat([this, offset, &low, &high, &candidate] {
+        [this, offset, entry_size](std::uint64_t& low, std::uint64_t& high, std::uint64_t& candidate) {
+            return seastar::repeat([this, offset, entry_size, &low, &high, &candidate] {
                 if (low >= high) {
                     return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
                 }
                 const auto mid = low + ((high - low) / 2);
-                return read_index_entry(mid * kIndexEntrySize).then(
+                return read_index_entry(mid * entry_size).then(
                     [offset, mid, &low, &high, &candidate](std::optional<IndexEntry> entry) {
                         if (!entry.has_value()) {
                             high = mid;
@@ -827,16 +902,16 @@ seastar::future<std::uint64_t> PartitionLogShard::find_index_position_for_offset
                         }
                         return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
                     });
-            }).then([&candidate] {
-                return seastar::make_ready_future<std::uint64_t>(candidate * kIndexEntrySize);
+            }).then([entry_size, &candidate] {
+                return seastar::make_ready_future<std::uint64_t>(candidate * entry_size);
             });
         });
 }
 
 seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_segment_record(const IndexEntry& entry) {
     const std::uint64_t header_size = 20;
-    const auto frame_size = round_up(header_size + static_cast<std::uint64_t>(entry.record_bytes), kLogFrameAlignment);
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, kLogFrameAlignment);
+    const auto frame_size = round_up(header_size + static_cast<std::uint64_t>(entry.record_bytes), log_frame_alignment_);
+    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, memory_dma_alignment_);
     auto raw = buffer.get();
     return seastar::open_file_dma(segment_path(entry.segment_base).string(), seastar::open_flags::ro).then(
         [entry, frame_size, raw, buffer = std::move(buffer)](seastar::file file) mutable {
@@ -872,7 +947,8 @@ seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_records_from_
     std::int64_t offset,
     std::int64_t visible_end,
     std::size_t limit) {
-    return seastar::do_with(
+    return wait_for_index_writes().then([this, offset, visible_end, limit] {
+        return seastar::do_with(
         std::vector<std::uint8_t>{},
         std::uint64_t{0},
         [this, offset, visible_end, limit](std::vector<std::uint8_t>& records, std::uint64_t& position) {
@@ -885,7 +961,7 @@ seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_records_from_
                             if (!entry.has_value()) {
                                 return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
                             }
-                            position += kIndexEntrySize;
+                            position += index_entry_size_;
                             if (entry->last_offset < offset) {
                                 return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
                             }
@@ -908,10 +984,11 @@ seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_records_from_
                 return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
             });
         });
+    });
 }
 
 void PartitionLogShard::note_index_entry(const IndexEntry& entry) {
-    const auto frame_size = round_up(20 + static_cast<std::uint64_t>(entry.record_bytes), kLogFrameAlignment);
+    const auto frame_size = round_up(20 + static_cast<std::uint64_t>(entry.record_bytes), log_frame_alignment_);
     const auto next_position = entry.segment_position + frame_size;
     if (segments_.empty() || segments_.back().base_offset != entry.segment_base) {
         segments_.push_back(SegmentInfo{entry.segment_base, entry.last_offset, next_position});
@@ -926,10 +1003,10 @@ seastar::future<> PartitionLogShard::write_rebuilt_index_entry(
     seastar::file& index_file,
     const IndexEntry& entry,
     std::uint64_t position) {
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(kIndexEntrySize, kLogFrameAlignment);
+    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(index_entry_size_, memory_dma_alignment_);
     encode_index_entry(buffer.get(), entry);
     auto raw = buffer.get();
-    return index_file.dma_write(position, raw, kIndexEntrySize).then(
+    return index_file.dma_write(position, raw, index_entry_size_).then(
         [buffer = std::move(buffer)](std::size_t) mutable {});
 }
 
@@ -951,8 +1028,8 @@ std::optional<PartitionLogShard::IndexEntry> PartitionLogShard::decode_index_ent
     return entry;
 }
 
-void PartitionLogShard::encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry) {
-    std::memset(bytes, 0, kIndexEntrySize);
+void PartitionLogShard::encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry) const {
+    std::memset(bytes, 0, index_entry_size_);
     std::memcpy(bytes, kIndexMagic, sizeof(kIndexMagic));
     put_i64(bytes + 8, entry.base_offset);
     put_i64(bytes + 16, entry.last_offset);
