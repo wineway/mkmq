@@ -1,0 +1,232 @@
+#pragma once
+
+#include "mkmq/config.hpp"
+#include "mkmq/kafka_protocol.hpp"
+#include "mkmq/mercury_shard.hpp"
+
+#include <seastar/core/file.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/internal/estimated_histogram.hh>
+#include <seastar/core/metrics.hh>
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/inet_address.hh>
+
+#include <cstdint>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace mkmq {
+
+using LatencyHistogram = seastar::metrics::internal::time_estimated_histogram;
+
+struct TopicPartition {
+    std::string topic;
+    std::int32_t partition{0};
+
+    bool operator<(const TopicPartition& other) const noexcept;
+};
+
+struct PartitionOffsets {
+    std::int64_t earliest{0};
+    std::int64_t latest{0};
+    std::int64_t high_watermark{0};
+};
+
+struct ReplicaAppendRequest {
+    std::string topic;
+    std::int32_t partition{0};
+    std::int64_t base_offset{0};
+    std::int64_t leader_high_watermark{0};
+    std::vector<std::uint8_t> records;
+};
+
+struct ReplicaFetchRequest {
+    std::string topic;
+    std::int32_t partition{0};
+    std::int64_t offset{0};
+    std::int32_t max_bytes{0};
+};
+
+struct ReplicaFetchResult {
+    std::int16_t error_code{0};
+    std::int64_t leader_high_watermark{0};
+    std::int64_t log_end_offset{0};
+    std::vector<std::uint8_t> records;
+};
+
+class PartitionLogShard {
+public:
+    seastar::future<> start(PartitionConfig config, std::filesystem::path root, std::uint64_t segment_bytes);
+    seastar::future<> stop();
+
+    const PartitionConfig& config() const noexcept;
+    PartitionOffsets offsets() const noexcept;
+    std::uint32_t queue_depth() const noexcept;
+    bool degraded() const noexcept;
+    std::int64_t replica_lag() const noexcept;
+    std::uint64_t disk_writes() const noexcept;
+    std::uint64_t disk_fsyncs() const noexcept;
+    LatencyHistogram disk_write_latency() const;
+    LatencyHistogram disk_fsync_latency() const;
+    void update_config(PartitionConfig config);
+
+    seastar::future<ProducePartitionResult> append(std::vector<std::uint8_t> records, std::int16_t acks);
+    seastar::future<ProducePartitionResult> append_replica(ReplicaAppendRequest request);
+    seastar::future<FetchPartitionResult> fetch(std::int64_t offset, std::int32_t max_bytes);
+    seastar::future<ReplicaFetchResult> fetch_for_replica(std::int64_t offset, std::int32_t max_bytes);
+    ListOffsetPartitionResult list_offsets(std::int64_t timestamp) const;
+    void mark_replicated_through(std::int64_t offset);
+    void mark_degraded();
+
+private:
+    struct RecordSet {
+        std::int64_t base_offset{0};
+        std::int64_t last_offset{-1};
+        std::vector<std::uint8_t> bytes;
+    };
+    struct IndexEntry {
+        std::int64_t base_offset{0};
+        std::int64_t last_offset{-1};
+        std::int64_t segment_base{0};
+        std::uint64_t segment_position{0};
+        std::int32_t record_bytes{0};
+    };
+    struct SegmentInfo {
+        std::int64_t base_offset{0};
+        std::int64_t last_offset{-1};
+        std::uint64_t write_position{0};
+    };
+
+    std::filesystem::path segment_path(std::int64_t base_offset) const;
+    std::filesystem::path index_path() const;
+    seastar::future<> recover();
+    seastar::future<bool> recover_from_index();
+    seastar::future<> recover_from_segments();
+    seastar::future<std::vector<std::pair<std::int64_t, std::filesystem::path>>> list_segment_files();
+    seastar::future<> recover_segment_file(
+        std::int64_t segment_base,
+        const std::filesystem::path& path,
+        seastar::file& rebuilt_index,
+        std::uint64_t& rebuilt_index_position);
+    seastar::future<> open_active_segment();
+    seastar::future<> open_index();
+    seastar::future<> ensure_segment_for_write(std::int64_t base_offset, std::uint64_t frame_size);
+    seastar::future<> write_record_set(const RecordSet& record_set);
+    seastar::future<> write_index_entry(
+        std::int64_t base_offset,
+        std::int64_t last_offset,
+        std::int32_t record_bytes,
+        std::int64_t segment_base,
+        std::uint64_t segment_position);
+    seastar::future<std::optional<IndexEntry>> read_index_entry(std::uint64_t position);
+    seastar::future<std::uint64_t> find_index_position_for_offset(std::int64_t offset);
+    seastar::future<std::vector<std::uint8_t>> read_segment_record(const IndexEntry& entry);
+    seastar::future<std::vector<std::uint8_t>> read_records_from_index(
+        std::int64_t offset,
+        std::int64_t visible_end,
+        std::size_t limit);
+    seastar::future<> write_rebuilt_index_entry(
+        seastar::file& index_file,
+        const IndexEntry& entry,
+        std::uint64_t position);
+    void note_index_entry(const IndexEntry& entry);
+    seastar::future<> maybe_flush();
+    static std::int64_t estimate_record_count(const std::vector<std::uint8_t>& records);
+    static std::optional<IndexEntry> decode_index_entry(const std::uint8_t* bytes);
+    static void encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry);
+
+    PartitionConfig config_;
+    std::filesystem::path root_;
+    std::uint64_t segment_bytes_{0};
+    std::vector<SegmentInfo> segments_;
+    PartitionOffsets offsets_;
+    std::uint32_t queue_depth_{0};
+    std::int64_t active_segment_base_offset_{0};
+    std::uint64_t write_position_{0};
+    bool degraded_{false};
+    std::int64_t replica_lag_{0};
+    std::optional<seastar::file> file_;
+    std::optional<seastar::file> index_file_;
+    std::uint64_t index_position_{0};
+    std::uint64_t disk_writes_{0};
+    std::uint64_t disk_fsyncs_{0};
+    LatencyHistogram disk_write_latency_;
+    LatencyHistogram disk_fsync_latency_;
+};
+
+class BrokerShard {
+public:
+    BrokerShard();
+
+    seastar::future<> start(BrokerConfig config);
+    seastar::future<> stop();
+    seastar::future<> apply_config(BrokerConfig config);
+    void set_peers(seastar::sharded<BrokerShard>* peers) noexcept;
+
+    const BrokerConfig& config() const noexcept;
+    seastar::future<std::optional<std::vector<std::uint8_t>>> handle_kafka_frame(
+        std::vector<std::uint8_t> payload);
+
+    seastar::future<ProducePartitionResult> append(
+        ProducePartitionRequest request,
+        std::int16_t acks,
+        std::int32_t timeout_ms);
+    seastar::future<FetchPartitionResult> fetch(FetchPartitionRequest request);
+    seastar::future<ListOffsetPartitionResult> list_offsets(ListOffsetPartitionRequest request);
+    seastar::future<ProducePartitionResult> append_replica(ReplicaAppendRequest request);
+
+    std::vector<TopicConfig> topics() const;
+    std::optional<PartitionConfig> partition_config(const std::string& topic, std::int32_t partition) const;
+
+private:
+    seastar::future<> accept_loop();
+    seastar::future<> handle_connection(seastar::connected_socket socket);
+    void register_metrics();
+    void register_mercury_rpcs();
+    void arm_maintenance_timer();
+    seastar::future<> maintenance_once();
+    seastar::future<> check_peer_health(std::int32_t broker_id);
+    seastar::future<> catch_up_follower_partition(const PartitionConfig& partition);
+    seastar::future<ReplicaFetchResult> fetch_for_replica(ReplicaFetchRequest request);
+    std::optional<unsigned> owner_shard(const std::string& topic, std::int32_t partition) const;
+    seastar::future<> replicate_to_isr(
+        const PartitionConfig& partition,
+        const ProducePartitionResult& local_result,
+        const std::vector<std::uint8_t>& records);
+    seastar::future<> send_replica_append(std::int32_t broker_id, ReplicaAppendRequest request);
+    seastar::future<ReplicaFetchResult> send_replica_fetch(std::int32_t broker_id, ReplicaFetchRequest request);
+
+    BrokerConfig config_;
+    seastar::sharded<BrokerShard>* peers_{nullptr};
+    std::map<TopicPartition, PartitionLogShard> partitions_;
+    MercuryShard mercury_;
+    KafkaProtocol protocol_;
+    bool stopping_{false};
+    std::optional<seastar::server_socket> listener_;
+    seastar::timer<> maintenance_timer_;
+    seastar::gate gate_;
+    seastar::metrics::metric_groups metrics_;
+    std::uint64_t kafka_requests_{0};
+    std::uint64_t kafka_errors_{0};
+    std::uint64_t produce_errors_{0};
+    std::uint64_t fetch_errors_{0};
+    std::uint64_t replica_appends_{0};
+    std::uint64_t replica_errors_{0};
+    std::uint64_t health_checks_{0};
+    std::uint64_t health_failures_{0};
+    std::uint64_t catchup_attempts_{0};
+    std::uint64_t catchup_errors_{0};
+    std::uint64_t catchup_records_{0};
+    LatencyHistogram kafka_request_latency_;
+    LatencyHistogram produce_latency_;
+    LatencyHistogram fetch_latency_;
+};
+
+}  // namespace mkmq

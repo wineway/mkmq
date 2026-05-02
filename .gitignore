@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+compile_commands.json
+mkmq-data/
+.cache/
+__pycache__/
+*.pyc
+.DS_Store

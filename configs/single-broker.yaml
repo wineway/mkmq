@@ -1,0 +1,25 @@
+node_id: 0
+cluster_generation: 1
+data_dir: /tmp/mkmq-single
+metrics_port: 9642
+fetch_max_wait_ms_cap: 100
+produce_wait_ms_cap: 100
+segment_bytes: 1073741824
+brokers:
+  - id: 0
+    kafka_host: 127.0.0.1
+    kafka_port: 9092
+    mercury_address: ofi+tcp;ofi_rxm://127.0.0.1:3344
+topics:
+  - name: orders
+    partitions:
+      - id: 0
+        shard: 0
+        leader: 0
+        replicas: [0]
+        isr: [0]
+        durability: write
+        queue_limit: 8192
+        max_frame_bytes: 1048576
+        fetch_visibility: high_watermark
+        allow_follower_fetch: false
