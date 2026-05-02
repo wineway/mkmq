@@ -44,8 +44,8 @@ public:
 private:
     friend void* mercury_client_cache_raw(MercuryShard* shard) noexcept;
 
-    void arm_progress_timer();
-    void progress_once();
+    void arm_progress_timer(bool recently_active = false);
+    bool progress_once();
     void register_mercury_rpc(const std::string& name);
 
     bool running_{false};

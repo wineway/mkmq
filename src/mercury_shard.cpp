@@ -25,6 +25,10 @@ namespace {
 
 constexpr hg_size_t kBulkTransferThreshold = 64 * 1024;
 constexpr std::size_t kHandlePoolLimitPerPeerRpc = 128;
+constexpr auto kMercuryIdleProgressInterval = std::chrono::microseconds(5);
+constexpr auto kMercuryActiveProgressInterval = std::chrono::microseconds(1);
+constexpr unsigned int kMercuryTriggerBatch = 64;
+constexpr std::size_t kMercuryProgressRounds = 8;
 
 enum class HgTransferMode : std::int32_t {
     Eager = 0,
@@ -593,8 +597,8 @@ hg_return_t mercury_respond_cb(const struct hg_cb_info* info) {
 
 MercuryShard::MercuryShard()
     : progress_timer_([this] {
-          progress_once();
-          arm_progress_timer();
+          const bool progressed = progress_once();
+          arm_progress_timer(progressed);
       })
 #if MKMQ_HAVE_MERCURY
     , client_cache_(new MercuryClientCache())
@@ -819,25 +823,49 @@ seastar::future<std::vector<std::uint8_t>> MercuryShard::forward(
 #endif
 }
 
-void MercuryShard::arm_progress_timer() {
+void MercuryShard::arm_progress_timer(bool recently_active) {
     if (running_) {
-        progress_timer_.arm(std::chrono::microseconds(50));
+        progress_timer_.arm(recently_active ? kMercuryActiveProgressInterval : kMercuryIdleProgressInterval);
     }
 }
 
-void MercuryShard::progress_once() {
+bool MercuryShard::progress_once() {
 #if MKMQ_HAVE_MERCURY
     if (!running_ || hg_context_ == nullptr) {
-        return;
+        return false;
     }
+    bool progressed = false;
     unsigned int actual_count = 0;
-    do {
-        const auto ret = HG_Trigger(static_cast<hg_context_t*>(hg_context_), 0, 16, &actual_count);
-        if (ret != HG_SUCCESS) {
+    for (std::size_t round = 0; round < kMercuryProgressRounds; ++round) {
+        bool triggered = false;
+        do {
+            const auto ret = HG_Trigger(
+                static_cast<hg_context_t*>(hg_context_),
+                0,
+                kMercuryTriggerBatch,
+                &actual_count);
+            if (ret != HG_SUCCESS) {
+                actual_count = 0;
+                break;
+            }
+            if (actual_count > 0) {
+                triggered = true;
+                progressed = true;
+            }
+        } while (actual_count > 0);
+
+        const auto progress_ret = HG_Progress(static_cast<hg_context_t*>(hg_context_), 0);
+        if (progress_ret == HG_SUCCESS) {
+            progressed = true;
+            continue;
+        }
+        if (!triggered) {
             break;
         }
-    } while (actual_count > 0);
-    (void) HG_Progress(static_cast<hg_context_t*>(hg_context_), 0);
+    }
+    return progressed;
+#else
+    return false;
 #endif
 }
 
