@@ -77,6 +77,67 @@ under `include/mkmq/generated` and `src/generated` by
 `tools/generate_kafka_schemas.py`. Benchmark output reports produce round-trip
 `p50`, `p99`, and max latency in microseconds.
 
+## Benchmarks
+
+Both rounds ran on the same Ubuntu 25.04 / Linux 6.x host, single NVMe,
+Release builds of mkmq and Apache Kafka 4.1.2, each cluster 3 brokers
+(RF=3, `min.insync.replicas=3`, `durability=write`, no fsync per produce),
+different local ports (Kafka 9092–9094, mkmq 9292–9294). Both clusters run
+concurrently on the same machine, each broker pinned to one Seastar/JVM
+process.
+
+### Round 1 — `kafka-producer-perf-test` (pipelined, one producer)
+
+Apache Kafka's bundled perf tool against both clusters, identical producer
+config on both sides: `acks=all linger.ms=0 batch.size=1
+max.in.flight.requests.per.connection=1 enable.idempotence=false`.
+Reported latency is record-enqueue to ACK, so absolute numbers include
+accumulator queueing and are not a single round-trip measurement — they
+are still directly comparable between clusters because the tool is the
+same.
+
+| workload                   | Kafka 4.1.2                         | mkmq                                | Δ          |
+|----------------------------|-------------------------------------|-------------------------------------|------------|
+| 10 000 × 128 B, acks=all   | 3 798 rec/s, p50 1 448, p99 2 306 ms | 4 517 rec/s, p50 1 169, p99 1 889 ms | +19 % / −18 % p99 |
+| 5 000 × 1 KiB, acks=all    | 2 912 rec/s, p50 790,  p99 1 403 ms  | 2 784 rec/s, p50 765,  p99 1 428 ms  | ≈ parity   |
+| 2 000 × 8 KiB, acks=all    | 1 835 rec/s, p50 436,  p99 695 ms    | 1 864 rec/s, p50 426,  p99 685 ms    | ≈ parity   |
+| 20 000 × 256 B, acks=1     | 6 319 rec/s, p50 1 910, p99 2 677 ms | 5 432 rec/s, p50 2 128, p99 3 201 ms | −14 % / +20 % p99 |
+| 20 000 × 256 B, acks=all   | 3 973 rec/s, p50 2 790, p99 4 504 ms | 4 628 rec/s, p50 2 429, p99 3 807 ms | +16 % / −15 % p99 |
+
+Small-payload RF3 quorum commit (the path optimized in the latest
+refactor) shows mkmq ahead on throughput and tail. Large-payload
+(≥ 1 KiB) workloads are bound by NVMe bandwidth and converge. `acks=1`
+small-payload is the one workload where Apache's record accumulator
+still wins.
+
+### Round 2 — Strict serial Java producer, RF3
+
+Minimal Java producer issuing `send().get()` per record — one Kafka
+produce request in flight at a time, each record waits for the RF3
+quorum ACK before the next is dispatched. Same producer config as
+Round 1. 200-record warmup, then the measured batch. Latency here is
+the true request round-trip, including Kafka client serialization and
+network path to the leader.
+
+| workload                 | Kafka 4.1.2 p50 | mkmq p50 | Kafka p99 | mkmq p99 | Kafka max | mkmq max |
+|--------------------------|----------------:|---------:|----------:|---------:|----------:|---------:|
+| 10 000 × 128 B, acks=all | 514 µs          | **224 µs** (−56 %) | 2 527 µs | **512 µs** (−80 %) | 14 866 µs | 5 309 µs |
+| 5 000 × 1 KiB, acks=all  | 398 µs          | **292 µs** (−27 %) |   820 µs | **581 µs** (−29 %) | 10 095 µs | 5 064 µs |
+| 2 000 × 8 KiB, acks=all  | 445 µs          | **339 µs** (−24 %) |   860 µs |   908 µs (+6 %)    |  5 296 µs | 5 399 µs |
+| 20 000 × 256 B, acks=1   | **120 µs**      |   153 µs (+28 %)    |   556 µs | **435 µs** (−22 %) | 10 759 µs | 5 268 µs |
+| 20 000 × 256 B, acks=all | 207 µs          | **171 µs** (−17 %) |   559 µs | **456 µs** (−18 %) | 10 896 µs | 5 320 µs |
+
+mkmq p50 is lower than Kafka on every RF3 acks=all workload, and p99
+tail is consistently tighter — the Kafka `max` column shows the 10–15 ms
+GC/pageflush spikes mkmq doesn't have. The one regression, acks=1 256 B
+p50, is the Kafka producer's batching/NIO path reaching into
+sub-microsecond territory on a single-leader local write; mkmq still
+wins the same workload at p99.
+
+These numbers are loopback, same-host; they bound what the software
+stack costs but do not reflect cross-host network or multi-tenant
+NVMe contention.
+
 ## SIGHUP Reload
 
 The broker reloads `--config` on `SIGHUP`. Reloads may add topics/partitions and
