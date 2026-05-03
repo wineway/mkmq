@@ -46,7 +46,7 @@ seastar::future<> PartitionLogShard::start(
     config_ = std::move(config);
     root_ = std::move(root);
     segment_bytes_ = segment_bytes;
-    index_write_tail_ = seastar::shared_future<>(seastar::make_ready_future<>());
+    index_entries_.clear();
     index_write_error_ = nullptr;
     return seastar::recursive_touch_directory(root_.string()).then([this] {
         return recover();
@@ -64,7 +64,13 @@ void PartitionLogShard::update_dma_alignment(const seastar::file& file) noexcept
 }
 
 seastar::future<> PartitionLogShard::stop() {
-    return wait_for_index_writes().finally([this] {
+    // Drain any in-flight index DMA writes scheduled via schedule_index_entry_write
+    // before we close the index file out from under them. If the gate was
+    // already closed (stop called twice), treat it as a no-op.
+    auto drain = index_write_gate_.is_closed()
+        ? seastar::make_ready_future<>()
+        : index_write_gate_.close();
+    return drain.finally([this] {
         std::vector<seastar::future<>> closes;
         if (file_.has_value()) {
             auto file = std::move(*file_);
@@ -255,6 +261,7 @@ std::filesystem::path PartitionLogShard::index_path() const {
 // ---- Recovery --------------------------------------------------------------
 seastar::future<> PartitionLogShard::recover() {
     segments_.clear();
+    index_entries_.clear();
     offsets_ = {};
     active_segment_base_offset_ = 0;
     write_position_ = 0;
@@ -267,6 +274,7 @@ seastar::future<> PartitionLogShard::recover() {
                     return seastar::make_ready_future<>();
                 }
                 segments_.clear();
+                index_entries_.clear();
                 offsets_ = {};
                 active_segment_base_offset_ = 0;
                 write_position_ = 0;
@@ -583,18 +591,28 @@ void PartitionLogShard::schedule_index_entry_write(
         index_write_error_ = std::make_exception_ptr(std::runtime_error("partition index file is not open"));
         return;
     }
-    IndexEntry entry{base_offset, last_offset, segment_base, segment_position, record_bytes};
+    const IndexEntry entry{base_offset, last_offset, segment_base, segment_position, record_bytes};
     const auto position = index_position_;
     index_position_ += index_entry_size_;
+    // Install into the in-memory authoritative index synchronously. Reads never
+    // wait on the disk write completing — the vector is the source of truth.
     note_index_entry(entry);
-    auto previous = index_write_tail_;
-    index_write_tail_ = seastar::shared_future<>(
-        previous.get_future().then([this, entry, position] {
-            return write_index_entry_at(entry, position);
-        }).handle_exception([this](std::exception_ptr error) {
-            index_write_error_ = error;
-            return seastar::make_exception_future<>(error);
-        }));
+    if (index_write_gate_.is_closed()) {
+        return;
+    }
+    // Each entry's file position is pre-assigned, so there is no ordering
+    // requirement between concurrent writes. Fire them all in parallel and let
+    // Seastar's IO scheduler coalesce.
+    (void) seastar::with_gate(index_write_gate_, [this, entry, position] {
+        return write_index_entry_at(entry, position).handle_exception(
+            [this](std::exception_ptr error) {
+                // Stash the first error we see; wait_for_index_writes() (called
+                // at stop / maybe_flush) will rethrow it.
+                if (!index_write_error_) {
+                    index_write_error_ = error;
+                }
+            });
+    });
 }
 
 seastar::future<> PartitionLogShard::write_index_entry_at(const IndexEntry& entry, std::uint64_t position) {
@@ -609,63 +627,27 @@ seastar::future<> PartitionLogShard::write_index_entry_at(const IndexEntry& entr
 }
 
 seastar::future<> PartitionLogShard::wait_for_index_writes() {
-    return index_write_tail_.get_future().then([this] {
-        if (index_write_error_) {
-            return seastar::make_exception_future<>(index_write_error_);
-        }
-        return seastar::make_ready_future<>();
-    });
+    // stop() drains the gate; callers outside of stop just need to see any
+    // latched error. Draining on every maybe_flush would defeat the whole
+    // point of firing index writes in parallel.
+    if (index_write_error_) {
+        return seastar::make_exception_future<>(index_write_error_);
+    }
+    return seastar::make_ready_future<>();
 }
 
 // ---- Index reading / record reading ----------------------------------------
-seastar::future<std::optional<PartitionLogShard::IndexEntry>> PartitionLogShard::read_index_entry(
-    std::uint64_t position) {
-    if (!index_file_.has_value() || position >= index_position_) {
-        return seastar::make_ready_future<std::optional<IndexEntry>>(std::nullopt);
-    }
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(index_entry_size_, memory_dma_alignment_);
-    const auto entry_size = index_entry_size_;
-    auto raw = buffer.get();
-    return index_file_->dma_read(position, raw, entry_size).then(
-        [entry_size, buffer = std::move(buffer)](std::size_t bytes_read) mutable {
-            if (bytes_read != entry_size) {
-                return seastar::make_ready_future<std::optional<IndexEntry>>(std::nullopt);
-            }
-            return seastar::make_ready_future<std::optional<IndexEntry>>(decode_index_entry(buffer.get()));
+std::size_t PartitionLogShard::find_index_for_offset(std::int64_t offset) const noexcept {
+    // index_entries_ is monotonically increasing in (base_offset, last_offset)
+    // — append order == offset order. Find the first entry that covers `offset`
+    // (i.e. last_offset >= offset). A linear memory lower_bound at O(log n)
+    // replaces the previous DMA-per-step on-disk binary search.
+    const auto it = std::lower_bound(
+        index_entries_.begin(), index_entries_.end(), offset,
+        [](const IndexEntry& entry, std::int64_t target) noexcept {
+            return entry.last_offset < target;
         });
-}
-
-seastar::future<std::uint64_t> PartitionLogShard::find_index_position_for_offset(std::int64_t offset) {
-    const auto entry_count = index_position_ / index_entry_size_;
-    const auto entry_size = index_entry_size_;
-    return seastar::do_with(
-        std::uint64_t{0},
-        entry_count,
-        entry_count,
-        [this, offset, entry_size](std::uint64_t& low, std::uint64_t& high, std::uint64_t& candidate) {
-            return seastar::repeat([this, offset, entry_size, &low, &high, &candidate] {
-                if (low >= high) {
-                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                }
-                const auto mid = low + ((high - low) / 2);
-                return read_index_entry(mid * entry_size).then(
-                    [offset, mid, &low, &high, &candidate](std::optional<IndexEntry> entry) {
-                        if (!entry.has_value()) {
-                            high = mid;
-                            return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
-                        }
-                        if (entry->last_offset < offset) {
-                            low = mid + 1;
-                        } else {
-                            candidate = mid;
-                            high = mid;
-                        }
-                        return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
-                    });
-            }).then([entry_size, &candidate] {
-                return seastar::make_ready_future<std::uint64_t>(candidate * entry_size);
-            });
-        });
+    return static_cast<std::size_t>(it - index_entries_.begin());
 }
 
 seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_segment_record(const IndexEntry& entry) {
@@ -707,47 +689,48 @@ seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_records_from_
     std::int64_t offset,
     std::int64_t visible_end,
     std::size_t limit) {
-    return wait_for_index_writes().then([this, offset, visible_end, limit] {
-        return seastar::do_with(
+    // Authoritative index is in memory — no waiting on in-flight DMA index
+    // writes, no per-step DMA on a binary search. Snapshot the starting
+    // position synchronously and drive the read loop off of index_entries_.
+    const auto start_idx = find_index_for_offset(offset);
+    return seastar::do_with(
         std::vector<std::uint8_t>{},
-        std::uint64_t{0},
-        [this, offset, visible_end, limit](std::vector<std::uint8_t>& records, std::uint64_t& position) {
-            return find_index_position_for_offset(offset).then([&position](std::uint64_t found_position) {
-                position = found_position;
-            }).then([this, offset, visible_end, limit, &records, &position] {
-                return seastar::repeat([this, offset, visible_end, limit, &records, &position] {
-                    return read_index_entry(position).then(
-                        [this, offset, visible_end, limit, &records, &position](std::optional<IndexEntry> entry) {
-                            if (!entry.has_value()) {
-                                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                            }
-                            position += index_entry_size_;
-                            if (entry->last_offset < offset) {
-                                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
-                            }
-                            if (entry->base_offset >= visible_end || entry->last_offset >= visible_end) {
-                                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                            }
-                            const auto record_bytes = static_cast<std::size_t>(entry->record_bytes);
-                            if (!records.empty() && records.size() + record_bytes > limit) {
-                                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                            }
-                            return read_segment_record(*entry).then(
-                                [limit, &records](std::vector<std::uint8_t> record_bytes) {
-                                    records.insert(records.end(), record_bytes.begin(), record_bytes.end());
-                                    return seastar::make_ready_future<seastar::stop_iteration>(
-                                        records.size() >= limit ? seastar::stop_iteration::yes : seastar::stop_iteration::no);
-                                });
-                        });
-                });
+        start_idx,
+        [this, offset, visible_end, limit](std::vector<std::uint8_t>& records, std::size_t& idx) {
+            return seastar::repeat([this, offset, visible_end, limit, &records, &idx] {
+                if (idx >= index_entries_.size()) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+                }
+                const IndexEntry entry = index_entries_[idx++];
+                if (entry.last_offset < offset) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
+                }
+                if (entry.base_offset >= visible_end || entry.last_offset >= visible_end) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+                }
+                const auto record_bytes = static_cast<std::size_t>(entry.record_bytes);
+                if (!records.empty() && records.size() + record_bytes > limit) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+                }
+                return read_segment_record(entry).then(
+                    [limit, &records](std::vector<std::uint8_t> record_bytes) {
+                        records.insert(records.end(), record_bytes.begin(), record_bytes.end());
+                        return seastar::make_ready_future<seastar::stop_iteration>(
+                            records.size() >= limit ? seastar::stop_iteration::yes : seastar::stop_iteration::no);
+                    });
             }).then([&records] {
                 return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
             });
         });
-    });
 }
 
 void PartitionLogShard::note_index_entry(const IndexEntry& entry) {
+    // Mirror every index entry into the in-memory vector so fetch / seek paths
+    // never touch the index file on the hot path. Entries arrive in append
+    // order (== offset order) from every caller: append's
+    // schedule_index_entry_write, recover_from_index's sequential scan, and
+    // recover_from_segments' per-frame walk.
+    index_entries_.push_back(entry);
     const auto frame_size = round_up(20 + static_cast<std::uint64_t>(entry.record_bytes), log_frame_alignment_);
     const auto next_position = entry.segment_position + frame_size;
     if (segments_.empty() || segments_.back().base_offset != entry.segment_base) {

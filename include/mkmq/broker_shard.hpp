@@ -130,8 +130,10 @@ private:
         std::uint64_t segment_position);
     seastar::future<> write_index_entry_at(const IndexEntry& entry, std::uint64_t position);
     seastar::future<> wait_for_index_writes();
-    seastar::future<std::optional<IndexEntry>> read_index_entry(std::uint64_t position);
-    seastar::future<std::uint64_t> find_index_position_for_offset(std::int64_t offset);
+    // Authoritative in-memory index lookup: returns the first index_entries_
+    // position whose last_offset >= offset, or index_entries_.size() if none.
+    // O(log n) std::lower_bound — no DMA read on the fetch hot path.
+    std::size_t find_index_for_offset(std::int64_t offset) const noexcept;
     seastar::future<std::vector<std::uint8_t>> read_segment_record(const IndexEntry& entry);
     seastar::future<std::vector<std::uint8_t>> read_records_from_index(
         std::int64_t offset,
@@ -164,7 +166,16 @@ private:
     std::optional<seastar::file> file_;
     std::optional<seastar::file> index_file_;
     std::uint64_t index_position_{0};
-    seastar::shared_future<> index_write_tail_;
+    // Authoritative in-memory mirror of the on-disk index, always in append
+    // order (== offset order). Fetch / seek paths consult this directly and
+    // never touch the index file on the hot path.
+    std::vector<IndexEntry> index_entries_;
+    // Gate around asynchronous index DMA writes. Every schedule_index_entry_write
+    // enters via with_gate; stop() closes it to drain in-flight writes. Having
+    // a gate — rather than the previous tail-chain shared_future — lets N
+    // concurrent appends issue their index DMA writes in parallel (positions
+    // are pre-assigned, so there's no ordering requirement).
+    seastar::gate index_write_gate_;
     std::exception_ptr index_write_error_;
     std::uint64_t disk_writes_{0};
     std::uint64_t disk_fsyncs_{0};
