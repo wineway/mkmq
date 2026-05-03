@@ -89,6 +89,13 @@ public:
     void mark_replicated_through(std::int64_t offset);
     void mark_degraded();
 
+    // Parse the Kafka record batch header chain to recover the delta between
+    // `records`'s base_offset and its last_offset. Exposed so BrokerShard can
+    // compute the log_end_offset synchronously before the DMA write starts —
+    // lets leader-side replication dispatch run in parallel with the local
+    // write instead of sequencing behind it.
+    static std::int64_t estimate_record_count(const std::vector<std::uint8_t>& records);
+
 private:
     struct RecordSet {
         std::int64_t base_offset{0};
@@ -168,7 +175,6 @@ private:
     void update_dma_alignment(const seastar::file& file) noexcept;
     void note_index_entry(const IndexEntry& entry);
     seastar::future<> maybe_flush();
-    static std::int64_t estimate_record_count(const std::vector<std::uint8_t>& records);
     static std::optional<IndexEntry> decode_index_entry(const std::uint8_t* bytes);
     void encode_index_entry(std::uint8_t* bytes, const IndexEntry& entry) const;
 

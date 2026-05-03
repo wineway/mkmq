@@ -330,39 +330,74 @@ seastar::future<ProducePartitionResult> BrokerShard::append(
         return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
     }
     auto records = rewrite_record_batch_offsets(request.records, partition_log->offsets().latest);
-    // Share one PartitionConfig across the nested lambdas instead of copying
-    // it three times (full struct with topic string + replicas/isr vectors).
-    // shared_ptr copies are atomic-inc/dec; on a single-threaded shard they
-    // turn into plain int increments under the hood.
-    auto partition_config = std::make_shared<const PartitionConfig>(partition_log->config());
-    auto operation = seastar::with_gate(gate_, [this, partition_log, partition_config, records = std::move(records), acks]() mutable {
-        return partition_log->append(records, acks).then(
-            [this, partition_config, records = std::move(records), acks](ProducePartitionResult result) mutable {
-            if (result.error_code != 0) {
-                return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
-            }
-            if (partition_config->isr.size() <= 1) {
-                return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
-            }
-            auto replication = replicate_to_isr(*partition_config, result, records);
-            if (acks == -1) {
-                return replication.then([this, partition_config, result]() mutable {
-                    if (auto* log = find_partition_log(partition_config->topic, partition_config->partition)) {
-                        log->mark_replicated_through(log->offsets().latest);
+    // lw_shared_ptr (non-atomic refcount) — BrokerShard is single-threaded per
+    // Seastar shard, so std::shared_ptr's atomic cmpxchg was pure waste on the
+    // hot path.
+    auto partition_config = seastar::make_lw_shared<const PartitionConfig>(partition_log->config());
+
+    // Compute the append plan synchronously: base_offset and log_end_offset
+    // are fully determined by `offsets().latest` + the record-batch headers
+    // before any disk I/O starts. Capturing them here lets us dispatch ISR
+    // replication in PARALLEL with the local DMA write instead of after it —
+    // acks=-1 tail latency becomes max(local_disk, net_rtt + remote_disk)
+    // instead of their sum. replicate_to_isr() encodes its wire payload
+    // synchronously before returning the future, so we only need `records`
+    // to be live at the call site; after that the future owns the encoded
+    // bytes and it's safe to move `records` into the local append.
+    const std::int64_t planned_base = partition_log->offsets().latest;
+    const std::int64_t planned_count = PartitionLogShard::estimate_record_count(records);
+    const std::int64_t planned_log_end = planned_base + planned_count;
+    ProducePartitionResult replica_stub;
+    replica_stub.topic = partition_config->topic;
+    replica_stub.partition = partition_config->partition;
+    replica_stub.base_offset = planned_base;
+    replica_stub.log_end_offset = planned_log_end;
+
+    auto operation = seastar::with_gate(gate_, [
+        this, partition_log, partition_config,
+        records = std::move(records), acks, replica_stub]() mutable {
+        seastar::future<> replicate_fut = partition_config->isr.size() > 1
+            ? replicate_to_isr(*partition_config, replica_stub, records)
+            : seastar::make_ready_future<>();
+        auto write_fut = partition_log->append(std::move(records), acks);
+
+        if (acks == -1) {
+            return std::move(write_fut).then(
+                [this, partition_config, rf = std::move(replicate_fut)](
+                    ProducePartitionResult result) mutable {
+                    if (result.error_code != 0) {
+                        // Local rejected the write (queue full, too large,
+                        // etc.). Swallow the replica future — followers may
+                        // have accepted, but we're reporting the local
+                        // refusal to the client.
+                        (void) std::move(rf).handle_exception([](std::exception_ptr) {});
+                        return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
                     }
-                    return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
-                }).handle_exception([this, partition_config, result](std::exception_ptr) mutable {
-                    ++replica_errors_;
-                    if (auto* log = find_partition_log(partition_config->topic, partition_config->partition)) {
-                        log->mark_degraded();
-                    }
-                    ProducePartitionResult failed = std::move(result);
-                    failed.error_code = static_cast<std::int16_t>(protocol::ErrorCode::NotEnoughReplicas);
-                    return seastar::make_ready_future<ProducePartitionResult>(std::move(failed));
+                    return std::move(rf).then(
+                        [this, partition_config, result]() mutable {
+                            if (auto* log = find_partition_log(partition_config->topic, partition_config->partition)) {
+                                log->mark_replicated_through(log->offsets().latest);
+                            }
+                            return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
+                        }).handle_exception([this, partition_config, result](std::exception_ptr) mutable {
+                            ++replica_errors_;
+                            if (auto* log = find_partition_log(partition_config->topic, partition_config->partition)) {
+                                log->mark_degraded();
+                            }
+                            ProducePartitionResult failed = std::move(result);
+                            failed.error_code = static_cast<std::int16_t>(protocol::ErrorCode::NotEnoughReplicas);
+                            return seastar::make_ready_future<ProducePartitionResult>(std::move(failed));
+                        });
                 });
-            }
-            (void) seastar::with_gate(gate_, [this, partition_config, replication = std::move(replication)]() mutable {
-                return std::move(replication).then([this, partition_config] {
+        }
+        // acks=0 / acks=1: return as soon as the local write completes. The
+        // replication future runs to completion behind the gate and feeds the
+        // degraded / HW signals the same way it did pre-refactor; it just
+        // happens to have started earlier (in parallel with the write), so
+        // follower lag recovers slightly faster too.
+        (void) seastar::with_gate(gate_,
+            [this, partition_config, rf = std::move(replicate_fut)]() mutable {
+                return std::move(rf).then([this, partition_config] {
                     if (auto* log = find_partition_log(partition_config->topic, partition_config->partition)) {
                         log->mark_replicated_through(log->offsets().latest);
                     }
@@ -373,8 +408,7 @@ seastar::future<ProducePartitionResult> BrokerShard::append(
                     }
                 });
             });
-            return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
-        });
+        return std::move(write_fut);
     });
     const auto cap_ms = static_cast<std::int32_t>(config_.produce_wait_ms_cap);
     const auto wait_ms = timeout_ms <= 0 ? cap_ms : std::min(timeout_ms, cap_ms);
