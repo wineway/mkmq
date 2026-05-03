@@ -70,7 +70,15 @@ seastar::future<> PartitionLogShard::stop() {
     auto drain = index_write_gate_.is_closed()
         ? seastar::make_ready_future<>()
         : index_write_gate_.close();
-    return drain.finally([this] {
+    return drain.then([this] {
+        // Drop all cached segment handles. Each shared_ptr's deleter enqueues
+        // the close() onto segment_close_gate_, which we drain below.
+        segment_cache_.clear();
+        if (segment_close_gate_.is_closed()) {
+            return seastar::make_ready_future<>();
+        }
+        return segment_close_gate_.close();
+    }).finally([this] {
         std::vector<seastar::future<>> closes;
         if (file_.has_value()) {
             auto file = std::move(*file_);
@@ -527,13 +535,23 @@ seastar::future<> PartitionLogShard::ensure_segment_for_write(std::int64_t base_
     if (write_position_ == 0 || write_position_ + frame_size <= segment_bytes_) {
         return seastar::make_ready_future<>();
     }
+    // Segment rollover. Instead of closing the old rw handle immediately (which
+    // would race with in-flight reads holding a shared aliased copy), hand it
+    // to the segment read cache. Future reads of this now-sealed segment hit
+    // the cache, and close() eventually happens via the shared_ptr deleter
+    // once cache + readers all release.
+    const auto sealed_base = active_segment_base_offset_;
     auto old_file = std::move(*file_);
     file_.reset();
-    return old_file.close().then([this, base_offset] {
-        active_segment_base_offset_ = base_offset;
-        write_position_ = 0;
-        return open_active_segment();
-    });
+    auto wrapped = seastar::make_lw_shared<CachedSegmentFile>(
+        std::move(old_file), &segment_close_gate_);
+    while (segment_cache_.size() >= kSegmentCacheMax) {
+        segment_cache_.pop_back();
+    }
+    segment_cache_.push_front(SegmentCacheEntry{sealed_base, std::move(wrapped)});
+    active_segment_base_offset_ = base_offset;
+    write_position_ = 0;
+    return open_active_segment();
 }
 
 seastar::future<> PartitionLogShard::write_record_set(const RecordSet& record_set) {
@@ -650,37 +668,83 @@ std::size_t PartitionLogShard::find_index_for_offset(std::int64_t offset) const 
     return static_cast<std::size_t>(it - index_entries_.begin());
 }
 
+PartitionLogShard::CachedSegmentFile::~CachedSegmentFile() {
+    // close_gate == nullptr marks an aliasing handle over the active segment —
+    // file_ owns the actual close, so we just drop our seastar::file value and
+    // decrement file_impl's (non-atomic) refcount.
+    if (close_gate == nullptr) {
+        return;
+    }
+    try {
+        (void) seastar::with_gate(*close_gate, [f = std::move(file)]() mutable {
+            return f.close();
+        });
+    } catch (const seastar::gate_closed_exception&) {
+        // Shutdown raced us. The reactor is tearing down; drop the handle and
+        // let file_impl's refcount drop to zero. close() wasn't made, so the
+        // FD may leak for the remainder of the process — but we're exiting.
+    }
+}
+
+seastar::future<PartitionLogShard::CachedSegmentPtr> PartitionLogShard::get_segment_file_for_read(
+    std::int64_t segment_base) {
+    // Active segment: return an aliasing handle (close_gate = nullptr). The
+    // copied seastar::file shares file_impl with file_ via its internal
+    // non-atomic intrusive refcount; when the reader's lw_shared_ptr drops,
+    // the aliasing wrapper's dtor is a no-op, preserving file_'s ownership of
+    // the FD and its close in stop()/rollover.
+    if (segment_base == active_segment_base_offset_ && file_.has_value()) {
+        return seastar::make_ready_future<CachedSegmentPtr>(
+            seastar::make_lw_shared<CachedSegmentFile>(*file_, nullptr));
+    }
+    // Cache hit: move to MRU and alias the cached handle.
+    for (auto it = segment_cache_.begin(); it != segment_cache_.end(); ++it) {
+        if (it->segment_base == segment_base) {
+            if (it != segment_cache_.begin()) {
+                segment_cache_.splice(segment_cache_.begin(), segment_cache_, it);
+            }
+            return seastar::make_ready_future<CachedSegmentPtr>(segment_cache_.front().file);
+        }
+    }
+    // Cache miss: open ro and install. Evicting the LRU just drops the cache's
+    // lw_shared_ptr; if readers still hold refs, the dtor (and thus close())
+    // defers until the last reader releases.
+    return seastar::open_file_dma(segment_path(segment_base).string(), seastar::open_flags::ro).then(
+        [this, segment_base](seastar::file file) {
+            auto wrapped = seastar::make_lw_shared<CachedSegmentFile>(
+                std::move(file), &segment_close_gate_);
+            while (segment_cache_.size() >= kSegmentCacheMax) {
+                segment_cache_.pop_back();
+            }
+            segment_cache_.push_front(SegmentCacheEntry{segment_base, wrapped});
+            return seastar::make_ready_future<CachedSegmentPtr>(std::move(wrapped));
+        });
+}
+
 seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_segment_record(const IndexEntry& entry) {
     const std::uint64_t header_size = 20;
     const auto frame_size = round_up(header_size + static_cast<std::uint64_t>(entry.record_bytes), log_frame_alignment_);
     auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, memory_dma_alignment_);
     auto raw = buffer.get();
-    return seastar::open_file_dma(segment_path(entry.segment_base).string(), seastar::open_flags::ro).then(
-        [entry, frame_size, raw, buffer = std::move(buffer)](seastar::file file) mutable {
-            return file.dma_read(entry.segment_position, raw, frame_size).then(
-                [entry, frame_size, file = std::move(file), buffer = std::move(buffer)](std::size_t bytes_read) mutable {
-                    std::exception_ptr error;
-                    std::vector<std::uint8_t> records;
-                    try {
-                        if (bytes_read != frame_size ||
-                            std::memcmp(buffer.get(), kLogMagic, sizeof(kLogMagic)) != 0 ||
-                            get_i64(reinterpret_cast<const char*>(buffer.get()) + 8) != entry.base_offset ||
-                            get_i32(reinterpret_cast<const char*>(buffer.get()) + 16) != entry.record_bytes) {
-                            throw std::runtime_error("partition segment frame is corrupt");
-                        }
-                        records.resize(static_cast<std::size_t>(entry.record_bytes));
-                        if (!records.empty()) {
-                            std::memcpy(records.data(), buffer.get() + 20, records.size());
-                        }
-                    } catch (...) {
-                        error = std::current_exception();
+    return get_segment_file_for_read(entry.segment_base).then(
+        [entry, frame_size, raw, buffer = std::move(buffer)](CachedSegmentPtr handle) mutable {
+            // Keep `handle` alive across the dma_read via the continuation's
+            // capture — lw_shared_ptr ref holds the FD open even if the cache
+            // evicts under us.
+            return handle->file.dma_read(entry.segment_position, raw, frame_size).then(
+                [entry, frame_size, handle, buffer = std::move(buffer)](std::size_t bytes_read) mutable {
+                    if (bytes_read != frame_size ||
+                        std::memcmp(buffer.get(), kLogMagic, sizeof(kLogMagic)) != 0 ||
+                        get_i64(reinterpret_cast<const char*>(buffer.get()) + 8) != entry.base_offset ||
+                        get_i32(reinterpret_cast<const char*>(buffer.get()) + 16) != entry.record_bytes) {
+                        return seastar::make_exception_future<std::vector<std::uint8_t>>(
+                            std::runtime_error("partition segment frame is corrupt"));
                     }
-                    return file.close().then([records = std::move(records), error]() mutable {
-                        if (error) {
-                            return seastar::make_exception_future<std::vector<std::uint8_t>>(error);
-                        }
-                        return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
-                    });
+                    std::vector<std::uint8_t> records(static_cast<std::size_t>(entry.record_bytes));
+                    if (!records.empty()) {
+                        std::memcpy(records.data(), buffer.get() + 20, records.size());
+                    }
+                    return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
                 });
         });
 }

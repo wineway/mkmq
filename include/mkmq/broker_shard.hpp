@@ -11,6 +11,7 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
@@ -18,6 +19,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -134,6 +136,26 @@ private:
     // position whose last_offset >= offset, or index_entries_.size() if none.
     // O(log n) std::lower_bound — no DMA read on the fetch hot path.
     std::size_t find_index_for_offset(std::int64_t offset) const noexcept;
+    // RAII wrapper around a seastar::file that defers close() to destruction.
+    // seastar::file itself uses non-atomic intrusive refcounting but does not
+    // auto-close on destruction — callers must call close() explicitly. This
+    // wrapper turns "close when last holder releases" into a destructor, and
+    // routes the async close() through segment_close_gate_ so stop() can
+    // drain the pending closes before tearing the reactor down.
+    //
+    // If close_gate is nullptr the destructor is a no-op: used for the active
+    // segment where file_ owns the close.
+    struct CachedSegmentFile {
+        seastar::file file;
+        seastar::gate* close_gate;
+        CachedSegmentFile(seastar::file f, seastar::gate* g) noexcept
+            : file(std::move(f)), close_gate(g) {}
+        CachedSegmentFile(const CachedSegmentFile&) = delete;
+        CachedSegmentFile& operator=(const CachedSegmentFile&) = delete;
+        ~CachedSegmentFile();
+    };
+    using CachedSegmentPtr = seastar::lw_shared_ptr<CachedSegmentFile>;
+    seastar::future<CachedSegmentPtr> get_segment_file_for_read(std::int64_t segment_base);
     seastar::future<std::vector<std::uint8_t>> read_segment_record(const IndexEntry& entry);
     seastar::future<std::vector<std::uint8_t>> read_records_from_index(
         std::int64_t offset,
@@ -165,6 +187,19 @@ private:
     std::int64_t replica_lag_{0};
     std::optional<seastar::file> file_;
     std::optional<seastar::file> index_file_;
+    // LRU cache of read-only handles for non-active segments. The active
+    // segment is always served directly from file_ (copy of the rw handle),
+    // bypassing the cache. Front is MRU, back is LRU. Evicted entries have
+    // their shared_ptr dropped — if a reader still holds one the underlying
+    // seastar::file stays alive until the reader's copy dies, then the
+    // gate-driven deleter closes it.
+    struct SegmentCacheEntry {
+        std::int64_t segment_base;
+        CachedSegmentPtr file;
+    };
+    std::list<SegmentCacheEntry> segment_cache_;
+    static constexpr std::size_t kSegmentCacheMax = 32;
+    seastar::gate segment_close_gate_;
     std::uint64_t index_position_{0};
     // Authoritative in-memory mirror of the on-disk index, always in append
     // order (== offset order). Fetch / seek paths consult this directly and
