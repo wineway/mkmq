@@ -387,28 +387,31 @@ seastar::future<std::optional<std::vector<std::uint8_t>>> KafkaProtocol::handle_
 }
 
 std::vector<std::uint8_t> rewrite_record_batch_offsets(
-    const std::vector<std::uint8_t>& records,
+    std::vector<std::uint8_t> records,
     std::int64_t base_offset) {
-    std::vector<std::uint8_t> rewritten = records;
+    // In-place rewrite over the caller's owned bytes. The previous
+    // implementation unconditionally copied the full records vector — every
+    // produce paid a memcpy proportional to batch size even though the
+    // caller was handing us its own buffer.
     std::size_t pos = 0;
     std::int64_t next_base = base_offset;
-    while (pos + 57 <= rewritten.size()) {
-        const auto batch_length = read_i32_be(rewritten, pos + 8);
+    while (pos + 57 <= records.size()) {
+        const auto batch_length = read_i32_be(records, pos + 8);
         if (batch_length <= 0) {
             break;
         }
         const auto batch_size = static_cast<std::size_t>(batch_length) + 12;
-        if (pos + batch_size > rewritten.size()) {
+        if (pos + batch_size > records.size()) {
             break;
         }
-        write_i64_be(rewritten, pos, next_base);
-        const auto crc = crc32c(rewritten.data() + pos + 21, batch_size - 21);
-        write_i32_be(rewritten, pos + 17, static_cast<std::int32_t>(crc));
-        const auto last_offset_delta = read_i32_be(rewritten, pos + 23);
+        write_i64_be(records, pos, next_base);
+        const auto crc = crc32c(records.data() + pos + 21, batch_size - 21);
+        write_i32_be(records, pos + 17, static_cast<std::int32_t>(crc));
+        const auto last_offset_delta = read_i32_be(records, pos + 23);
         next_base += std::max<std::int64_t>(1, static_cast<std::int64_t>(last_offset_delta) + 1);
         pos += batch_size;
     }
-    return rewritten;
+    return records;
 }
 
 }  // namespace mkmq

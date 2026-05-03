@@ -329,7 +329,7 @@ seastar::future<ProducePartitionResult> BrokerShard::append(
         result.error_code = static_cast<std::int16_t>(protocol::ErrorCode::NotLeaderOrFollower);
         return seastar::make_ready_future<ProducePartitionResult>(std::move(result));
     }
-    auto records = rewrite_record_batch_offsets(request.records, partition_log->offsets().latest);
+    auto records = rewrite_record_batch_offsets(std::move(request.records), partition_log->offsets().latest);
     // lw_shared_ptr (non-atomic refcount) — BrokerShard is single-threaded per
     // Seastar shard, so std::shared_ptr's atomic cmpxchg was pure waste on the
     // hot path.

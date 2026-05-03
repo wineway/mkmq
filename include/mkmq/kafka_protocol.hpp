@@ -79,8 +79,13 @@ private:
     BrokerShard& broker_;
 };
 
+// Rewrite the batch headers of `records` in place so each batch's base
+// offset starts at `base_offset` (and CRCs are recomputed). Takes the vector
+// by value so callers can std::move into it: the previous
+// `const&` + internal full-copy was an unconditional memcpy on every produce
+// regardless of whether the caller already owned the bytes.
 std::vector<std::uint8_t> rewrite_record_batch_offsets(
-    const std::vector<std::uint8_t>& records,
+    std::vector<std::uint8_t> records,
     std::int64_t base_offset);
 
 }  // namespace mkmq
