@@ -740,71 +740,79 @@ seastar::future<PartitionLogShard::CachedSegmentPtr> PartitionLogShard::get_segm
         });
 }
 
-seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_segment_record(const IndexEntry& entry) {
-    const std::uint64_t header_size = 20;
-    const auto frame_size = round_up(header_size + static_cast<std::uint64_t>(entry.record_bytes), log_frame_alignment_);
-    auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(frame_size, memory_dma_alignment_);
-    auto raw = buffer.get();
-    return get_segment_file_for_read(entry.segment_base).then(
-        [entry, frame_size, raw, buffer = std::move(buffer)](CachedSegmentPtr handle) mutable {
-            // Keep `handle` alive across the dma_read via the continuation's
-            // capture — lw_shared_ptr ref holds the FD open even if the cache
-            // evicts under us.
-            return handle->file.dma_read(entry.segment_position, raw, frame_size).then(
-                [entry, frame_size, handle, buffer = std::move(buffer)](std::size_t bytes_read) mutable {
-                    if (bytes_read != frame_size ||
-                        std::memcmp(buffer.get(), kLogMagic, sizeof(kLogMagic)) != 0 ||
-                        get_i64(reinterpret_cast<const char*>(buffer.get()) + 8) != entry.base_offset ||
-                        get_i32(reinterpret_cast<const char*>(buffer.get()) + 16) != entry.record_bytes) {
-                        return seastar::make_exception_future<std::vector<std::uint8_t>>(
-                            std::runtime_error("partition segment frame is corrupt"));
-                    }
-                    std::vector<std::uint8_t> records(static_cast<std::size_t>(entry.record_bytes));
-                    if (!records.empty()) {
-                        std::memcpy(records.data(), buffer.get() + 20, records.size());
-                    }
-                    return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
-                });
-        });
-}
-
 seastar::future<std::vector<std::uint8_t>> PartitionLogShard::read_records_from_index(
     std::int64_t offset,
     std::int64_t visible_end,
     std::size_t limit) {
-    // Authoritative index is in memory — no waiting on in-flight DMA index
-    // writes, no per-step DMA on a binary search. Snapshot the starting
-    // position synchronously and drive the read loop off of index_entries_.
-    const auto start_idx = find_index_for_offset(offset);
-    return seastar::do_with(
-        std::vector<std::uint8_t>{},
-        start_idx,
-        [this, offset, visible_end, limit](std::vector<std::uint8_t>& records, std::size_t& idx) {
-            return seastar::repeat([this, offset, visible_end, limit, &records, &idx] {
-                if (idx >= index_entries_.size()) {
-                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                }
-                const IndexEntry entry = index_entries_[idx++];
-                if (entry.last_offset < offset) {
-                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
-                }
-                if (entry.base_offset >= visible_end || entry.last_offset >= visible_end) {
-                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                }
-                const auto record_bytes = static_cast<std::size_t>(entry.record_bytes);
-                if (!records.empty() && records.size() + record_bytes > limit) {
-                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
-                }
-                return read_segment_record(entry).then(
-                    [limit, &records](std::vector<std::uint8_t> record_bytes) {
-                        records.insert(records.end(), record_bytes.begin(), record_bytes.end());
-                        return seastar::make_ready_future<seastar::stop_iteration>(
-                            records.size() >= limit ? seastar::stop_iteration::yes : seastar::stop_iteration::no);
-                    });
-            }).then([&records] {
-                return seastar::make_ready_future<std::vector<std::uint8_t>>(std::move(records));
-            });
-        });
+    // Merge contiguous same-segment index entries into ONE dma_read per run.
+    // The previous implementation did one dma_read per index entry, and each
+    // entry also went through open+read+close (pre-cache) — so fetching 256
+    // 4 KiB records meant 256 DMA submits and 256 syscalls. With segment
+    // handles cached and a merged run, a fetch that fits in one segment
+    // becomes a single DMA submit, parsing each entry out of the one aligned
+    // buffer.
+    std::vector<std::uint8_t> records;
+    std::size_t idx = find_index_for_offset(offset);
+    while (idx < index_entries_.size()) {
+        const auto& first = index_entries_[idx];
+        if (first.last_offset < offset) {
+            ++idx;
+            continue;
+        }
+        if (first.base_offset >= visible_end || first.last_offset >= visible_end) {
+            break;
+        }
+        const auto first_rb = static_cast<std::size_t>(first.record_bytes);
+        // Match the original per-entry limit semantics: the first ever entry
+        // is always admitted even if larger than `limit`; subsequent entries
+        // are only admitted if they fit.
+        if (!records.empty() && records.size() + first_rb > limit) {
+            break;
+        }
+        const auto segment_base = first.segment_base;
+        const auto run_start_position = first.segment_position;
+        std::size_t run_count = 1;
+        std::size_t run_record_bytes = first_rb;
+        std::uint64_t run_total_bytes = round_up(
+            20 + static_cast<std::uint64_t>(first.record_bytes), log_frame_alignment_);
+        while (idx + run_count < index_entries_.size()) {
+            const auto& e = index_entries_[idx + run_count];
+            if (e.base_offset >= visible_end || e.last_offset >= visible_end) break;
+            if (e.segment_base != segment_base) break;
+            const auto rb = static_cast<std::size_t>(e.record_bytes);
+            if (records.size() + run_record_bytes + rb > limit) break;
+            const auto frame_size = round_up(
+                20 + static_cast<std::uint64_t>(e.record_bytes), log_frame_alignment_);
+            run_record_bytes += rb;
+            run_total_bytes = (e.segment_position - run_start_position) + frame_size;
+            ++run_count;
+        }
+
+        auto buffer = seastar::allocate_aligned_buffer<std::uint8_t>(
+            run_total_bytes, memory_dma_alignment_);
+        auto handle = co_await get_segment_file_for_read(segment_base);
+        const auto bytes_read = co_await handle->file.dma_read(
+            run_start_position, buffer.get(), run_total_bytes);
+        if (bytes_read != run_total_bytes) {
+            throw std::runtime_error("partition segment short read");
+        }
+        for (std::size_t k = 0; k < run_count; ++k) {
+            const auto& e = index_entries_[idx + k];
+            const auto relative = e.segment_position - run_start_position;
+            const auto* header = buffer.get() + relative;
+            if (std::memcmp(header, kLogMagic, sizeof(kLogMagic)) != 0
+                || get_i64(reinterpret_cast<const char*>(header) + 8) != e.base_offset
+                || get_i32(reinterpret_cast<const char*>(header) + 16) != e.record_bytes) {
+                throw std::runtime_error("partition segment frame is corrupt");
+            }
+            const auto* payload = header + 20;
+            records.insert(records.end(), payload,
+                           payload + static_cast<std::size_t>(e.record_bytes));
+        }
+        idx += run_count;
+        if (records.size() >= limit) break;
+    }
+    co_return records;
 }
 
 void PartitionLogShard::note_index_entry(const IndexEntry& entry) {

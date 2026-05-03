@@ -163,7 +163,6 @@ private:
     };
     using CachedSegmentPtr = seastar::lw_shared_ptr<CachedSegmentFile>;
     seastar::future<CachedSegmentPtr> get_segment_file_for_read(std::int64_t segment_base);
-    seastar::future<std::vector<std::uint8_t>> read_segment_record(const IndexEntry& entry);
     seastar::future<std::vector<std::uint8_t>> read_records_from_index(
         std::int64_t offset,
         std::int64_t visible_end,
