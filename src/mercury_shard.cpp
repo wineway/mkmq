@@ -8,6 +8,7 @@
 #endif
 
 #include <seastar/core/future.hh>
+#include <seastar/core/timer.hh>
 
 #include <algorithm>
 #include <chrono>
@@ -15,20 +16,40 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace mkmq {
-namespace {
 
 #if MKMQ_HAVE_MERCURY
+
+namespace {
 
 constexpr hg_size_t kBulkTransferThreshold = 64 * 1024;
 constexpr std::size_t kHandlePoolLimitPerPeerRpc = 128;
 constexpr auto kMercuryIdleProgressInterval = std::chrono::microseconds(5);
 constexpr auto kMercuryActiveProgressInterval = std::chrono::microseconds(1);
+constexpr auto kForwardTimeout = std::chrono::milliseconds(100);
 constexpr unsigned int kMercuryTriggerBatch = 64;
 constexpr std::size_t kMercuryProgressRounds = 8;
+
+// Transparent hasher that lets us look up std::string-keyed maps with a
+// std::string_view (no temporary string allocation at every lookup).
+struct StringHash {
+    using is_transparent = void;
+    using hash_type = std::hash<std::string_view>;
+    std::size_t operator()(std::string_view sv) const noexcept {
+        return hash_type{}(sv);
+    }
+    std::size_t operator()(const std::string& s) const noexcept {
+        return hash_type{}(s);
+    }
+    std::size_t operator()(const char* s) const noexcept {
+        return hash_type{}(s);
+    }
+};
 
 enum class HgTransferMode : std::int32_t {
     Eager = 0,
@@ -52,219 +73,368 @@ struct HgReply {
     HgBytes payload;
 };
 
-struct ClientRpcState {
-    ClientRpcState()
-        : timeout_timer([this] {
-              if (!promise_done) {
-                  promise.set_exception(std::runtime_error("Mercury RPC timed out for peer: " + peer));
-                  promise_done = true;
-                  if (rpc_errors != nullptr) {
-                      ++*rpc_errors;
-                  }
-                  if (rpc_timeouts != nullptr) {
-                      ++*rpc_timeouts;
-                  }
-                  if (forward_latency != nullptr) {
-                      forward_latency->add(std::chrono::steady_clock::now() - started);
-                      latency_recorded = true;
-                  }
-              }
-          }) {}
-
-    seastar::promise<std::vector<std::uint8_t>> promise;
-    seastar::timer<> timeout_timer;
-    std::chrono::steady_clock::time_point started;
-    hg_class_t* hg_class{nullptr};
-    hg_context_t* hg_context{nullptr};
-    hg_addr_t addr{HG_ADDR_NULL};
-    hg_handle_t handle{HG_HANDLE_NULL};
-    hg_id_t rpc_id{0};
-    std::string peer;
-    std::vector<std::uint8_t> request;
-    HgRequest input;
-    hg_bulk_t origin_bulk{HG_BULK_NULL};
-    HgReply output;
-    bool promise_done{false};
-    bool latency_recorded{false};
-    std::uint64_t* rpc_errors{nullptr};
-    std::uint64_t* rpc_timeouts{nullptr};
-    seastar::metrics::internal::time_estimated_histogram* forward_latency{nullptr};
-    MercuryShard* shard{nullptr};
-    std::string handle_pool_key;
-    bool recycle_handle{false};
-    bool drop_peer_cache{false};
-};
-
-struct LookupState {
-    MercuryShard* shard{nullptr};
-    hg_class_t* hg_class{nullptr};
-    hg_context_t* hg_context{nullptr};
-    std::string peer;
-    std::vector<std::unique_ptr<ClientRpcState>> waiters;
-    bool cancelled{false};
-};
-
-struct ServerRpcState {
-    hg_handle_t handle{HG_HANDLE_NULL};
-    MercuryShard::RpcHandler* handler{nullptr};
-    HgRequest input;
-    bool input_loaded{false};
-    hg_bulk_t local_bulk{HG_BULK_NULL};
-    std::vector<std::uint8_t> request;
-    std::vector<std::uint8_t> response;
-    HgReply output;
-    std::chrono::steady_clock::time_point started;
-    seastar::metrics::internal::time_estimated_histogram* handler_latency{nullptr};
-    seastar::metrics::internal::time_estimated_histogram* bulk_latency{nullptr};
-    std::uint64_t* rpc_errors{nullptr};
-    std::uint64_t* bulk_transfers{nullptr};
-    std::uint64_t* bulk_bytes{nullptr};
-    std::uint64_t* bulk_errors{nullptr};
-};
-
-hg_return_t mercury_respond_cb(const struct hg_cb_info* info);
-hg_return_t mercury_forward_cb(const struct hg_cb_info* info);
-hg_return_t mercury_lookup_cb(const struct hg_cb_info* info);
-void cleanup_client_mercury_resources(ClientRpcState& state);
-
-struct MercuryClientCache {
-    std::unordered_map<std::string, hg_addr_t> addrs;
-    std::unordered_map<std::string, std::unique_ptr<LookupState>> lookups;
-    std::unordered_map<std::string, std::vector<hg_handle_t>> handle_pools;
-    std::vector<std::unique_ptr<LookupState>> orphaned_lookups;
-};
-
 }  // namespace
 
-void* mercury_client_cache_raw(MercuryShard* shard) noexcept {
-    return shard->client_cache_;
-}
+#endif  // MKMQ_HAVE_MERCURY
 
-namespace {
+// ---------------------------------------------------------------------------
+// Impl — owns all Mercury-specific state. Public MercuryShard methods are
+// thin forwarders defined at the bottom of this file.
+// ---------------------------------------------------------------------------
+struct MercuryShard::Impl {
+#if MKMQ_HAVE_MERCURY
+    struct LookupState;
+    struct ClientRpcState;
+    struct ServerRpcState;
 
-MercuryClientCache& mercury_client_cache(MercuryShard* shard) {
-    return *static_cast<MercuryClientCache*>(mercury_client_cache_raw(shard));
-}
+    // One registered RPC, indexed by both name and Mercury id.
+    struct RpcEntry {
+        std::string name;
+        hg_id_t id{0};
+        RpcHandler handler;
+    };
 
-std::string handle_pool_key(const std::string& peer, hg_id_t rpc_id) {
-    std::string key = peer;
-    key.push_back('\0');
-    key += std::to_string(static_cast<std::uint64_t>(rpc_id));
-    return key;
-}
+    // Per-peer handle pool. One slot per RPC id. In a typical replica-fan-out
+    // deployment a peer sees ≤ 3 RPC ids, so a linear scan over a small flat
+    // vector is faster and more cache-friendly than std::unordered_map.
+    struct HandlePool {
+        hg_id_t rpc_id{0};
+        std::vector<hg_handle_t> handles;
+    };
 
-hg_addr_t cached_peer_addr(MercuryShard* shard, const std::string& peer) {
-    auto& cache = mercury_client_cache(shard);
-    const auto it = cache.addrs.find(peer);
-    return it == cache.addrs.end() ? HG_ADDR_NULL : it->second;
-}
+    // Per-peer client-side state. Erased atomically when the peer endpoint is
+    // dropped (transport error, shutdown, etc.).
+    struct PeerState {
+        hg_addr_t addr{HG_ADDR_NULL};
+        std::vector<HandlePool> pools;  // small, typically ≤ 3 entries
+        std::unique_ptr<LookupState> pending_lookup;
+    };
 
-hg_addr_t cache_peer_addr(MercuryShard* shard, hg_class_t* hg_class, const std::string& peer, hg_addr_t addr) {
-    auto& cache = mercury_client_cache(shard);
-    const auto [it, inserted] = cache.addrs.emplace(peer, addr);
-    if (!inserted) {
-        if (addr != HG_ADDR_NULL && addr != it->second) {
-            (void) HG_Addr_free(hg_class, addr);
+    // In-flight address-lookup record. Multiple producers collide on the same
+    // peer; `waiters` fans out when the lookup callback fires.
+    struct LookupState {
+        Impl* impl{nullptr};
+        std::string peer;
+        std::vector<std::unique_ptr<ClientRpcState>> waiters;
+        bool cancelled{false};
+    };
+
+    // Client-side per-RPC bookkeeping. Lives as a unique_ptr that is released
+    // across each Mercury callback boundary.
+    struct ClientRpcState {
+        explicit ClientRpcState(Impl* owner)
+            : impl(owner),
+              timeout_timer([this] {
+                  if (!promise_done) {
+                      promise.set_exception(std::runtime_error(
+                          "Mercury RPC timed out for peer: " + peer));
+                      promise_done = true;
+                      impl->on_rpc_error();
+                      impl->on_rpc_timeout();
+                      impl->record_forward_latency_if_needed(*this);
+                  }
+              }) {}
+
+        Impl* impl;
+        seastar::promise<std::vector<std::uint8_t>> promise;
+        seastar::timer<> timeout_timer;
+        std::chrono::steady_clock::time_point started;
+        hg_addr_t addr{HG_ADDR_NULL};
+        hg_handle_t handle{HG_HANDLE_NULL};
+        hg_id_t rpc_id{0};
+        std::string peer;
+        std::vector<std::uint8_t> request;
+        HgRequest input;
+        hg_bulk_t origin_bulk{HG_BULK_NULL};
+        HgReply output;
+        bool promise_done{false};
+        bool latency_recorded{false};
+        bool recycle_handle{false};
+        bool drop_peer_on_cleanup{false};
+    };
+
+    // Server-side per-RPC bookkeeping.
+    struct ServerRpcState {
+        explicit ServerRpcState(Impl* owner) : impl(owner) {}
+
+        Impl* impl;
+        hg_handle_t handle{HG_HANDLE_NULL};
+        RpcEntry* rpc{nullptr};
+        HgRequest input;
+        bool input_loaded{false};
+        hg_bulk_t local_bulk{HG_BULK_NULL};
+        std::vector<std::uint8_t> request;
+        std::vector<std::uint8_t> response;
+        HgReply output;
+        std::chrono::steady_clock::time_point started;
+    };
+
+    // ----- counters & histograms -------------------------------------------
+    void on_rpc_forward() noexcept { ++rpc_forwards; }
+    void on_rpc_receive() noexcept { ++rpc_receives; }
+    void on_rpc_error() noexcept { ++rpc_errors; }
+    void on_rpc_timeout() noexcept { ++rpc_timeouts; }
+    void on_bulk_transfer(std::uint64_t bytes) noexcept {
+        ++bulk_transfers;
+        bulk_bytes += bytes;
+    }
+    void on_bulk_error() noexcept { ++bulk_errors; }
+
+    void record_forward_latency_if_needed(ClientRpcState& state) {
+        if (!state.latency_recorded) {
+            rpc_forward_latency.add(std::chrono::steady_clock::now() - state.started);
+            state.latency_recorded = true;
         }
-        return it->second;
     }
-    return addr;
-}
+    void record_handler_latency(const ServerRpcState& state) {
+        rpc_handler_latency.add(std::chrono::steady_clock::now() - state.started);
+    }
+    void record_bulk_latency(const ServerRpcState& state) {
+        bulk_latency.add(std::chrono::steady_clock::now() - state.started);
+    }
 
-std::unique_ptr<LookupState> take_lookup_state(MercuryShard* shard, const std::string& peer) {
-    auto& cache = mercury_client_cache(shard);
-    auto it = cache.lookups.find(peer);
-    if (it == cache.lookups.end()) {
+    // ----- RPC registry -----------------------------------------------------
+    // Hot path: `forward(rpc_name)` is called with the same RPC name
+    // repeatedly. The last-used pointer short-circuits the map lookup entirely
+    // in the steady state.
+    RpcEntry* find_rpc_by_name(std::string_view name) {
+        if (last_rpc_ != nullptr && last_rpc_->name == name) {
+            return last_rpc_;
+        }
+        const auto it = rpcs_by_name.find(name);
+        if (it == rpcs_by_name.end()) {
+            return nullptr;
+        }
+        last_rpc_ = it->second.get();
+        return last_rpc_;
+    }
+    RpcEntry* find_rpc_by_id(hg_id_t id) {
+        // Server-side lookup. With typically ≤ 3 registered RPCs a linear scan
+        // beats a hash table in both latency and cache footprint.
+        for (const auto& [eid, entry] : rpcs_by_id) {
+            if (eid == id) {
+                return entry;
+            }
+        }
         return nullptr;
     }
-    auto state = std::move(it->second);
-    cache.lookups.erase(it);
-    return state;
-}
 
-std::unique_ptr<LookupState> take_orphaned_lookup_state(LookupState* raw_lookup) {
-    auto& lookups = mercury_client_cache(raw_lookup->shard).orphaned_lookups;
-    const auto it = std::find_if(lookups.begin(), lookups.end(), [raw_lookup](const auto& lookup) {
-        return lookup.get() == raw_lookup;
-    });
-    if (it == lookups.end()) {
-        return nullptr;
+    void register_handler(std::string_view name, RpcHandler handler) {
+        auto it = rpcs_by_name.find(name);
+        RpcEntry* entry;
+        if (it == rpcs_by_name.end()) {
+            auto new_entry = std::make_unique<RpcEntry>();
+            new_entry->name = std::string(name);
+            entry = new_entry.get();
+            rpcs_by_name.emplace(entry->name, std::move(new_entry));
+        } else {
+            entry = it->second.get();
+        }
+        entry->handler = std::move(handler);
+        if (hg_class != nullptr && entry->id == 0) {
+            bind_rpc_to_mercury(*entry);
+        }
     }
-    auto state = std::move(*it);
-    lookups.erase(it);
-    return state;
-}
 
-hg_handle_t take_cached_handle(MercuryShard* shard, const std::string& key) {
-    auto& cache = mercury_client_cache(shard);
-    auto it = cache.handle_pools.find(key);
-    if (it == cache.handle_pools.end() || it->second.empty()) {
+    // Allocate a Mercury id for an already-registered RpcEntry.
+    void bind_rpc_to_mercury(RpcEntry& entry);
+
+    // ----- peer cache -------------------------------------------------------
+    PeerState& peer_state(std::string_view peer) {
+        const auto it = peers.find(peer);
+        if (it != peers.end()) {
+            return it->second;
+        }
+        auto [new_it, _] = peers.emplace(std::string(peer), PeerState{});
+        return new_it->second;
+    }
+    PeerState* find_peer(std::string_view peer) {
+        const auto it = peers.find(peer);
+        return it == peers.end() ? nullptr : &it->second;
+    }
+
+    hg_handle_t take_cached_handle(PeerState& peer, hg_id_t rpc_id) {
+        // Linear scan over ≤ 3 entries; faster than a hash table in practice.
+        for (auto& pool : peer.pools) {
+            if (pool.rpc_id == rpc_id) {
+                if (pool.handles.empty()) {
+                    return HG_HANDLE_NULL;
+                }
+                auto handle = pool.handles.back();
+                pool.handles.pop_back();
+                return handle;
+            }
+        }
         return HG_HANDLE_NULL;
     }
-    auto handle = it->second.back();
-    it->second.pop_back();
-    return handle;
-}
 
-void recycle_cached_handle(MercuryShard* shard, const std::string& key, hg_handle_t handle) {
-    auto& pool = mercury_client_cache(shard).handle_pools[key];
-    if (pool.size() >= kHandlePoolLimitPerPeerRpc) {
-        (void) HG_Destroy(handle);
-        return;
-    }
-    pool.push_back(handle);
-}
-
-void drop_peer_cache(MercuryShard* shard, hg_class_t* hg_class, const std::string& peer) {
-    auto& cache = mercury_client_cache(shard);
-    auto addr_it = cache.addrs.find(peer);
-    if (addr_it != cache.addrs.end()) {
-        (void) HG_Addr_free(hg_class, addr_it->second);
-        cache.addrs.erase(addr_it);
-    }
-
-    const std::string prefix = peer + '\0';
-    for (auto it = cache.handle_pools.begin(); it != cache.handle_pools.end();) {
-        if (it->first.rfind(prefix, 0) != 0) {
-            ++it;
-            continue;
-        }
-        for (auto handle : it->second) {
+    void recycle_handle(std::string_view peer, hg_id_t rpc_id, hg_handle_t handle) {
+        const auto it = peers.find(peer);
+        if (it == peers.end()) {
             (void) HG_Destroy(handle);
+            return;
         }
-        it = cache.handle_pools.erase(it);
-    }
-}
-
-void clear_client_cache(MercuryShard* shard, hg_class_t* hg_class) {
-    if (mercury_client_cache_raw(shard) == nullptr) {
-        return;
-    }
-    auto& cache = mercury_client_cache(shard);
-    for (auto& [_, lookup] : cache.lookups) {
-        for (auto& waiter : lookup->waiters) {
-            if (!waiter->promise_done) {
-                waiter->promise.set_exception(std::runtime_error("Mercury shard stopped during address lookup"));
-                waiter->promise_done = true;
+        auto& peer_entry = it->second;
+        for (auto& pool : peer_entry.pools) {
+            if (pool.rpc_id == rpc_id) {
+                if (pool.handles.size() >= kHandlePoolLimitPerPeerRpc) {
+                    (void) HG_Destroy(handle);
+                } else {
+                    pool.handles.push_back(handle);
+                }
+                return;
             }
-            cleanup_client_mercury_resources(*waiter);
         }
-        lookup->waiters.clear();
-        lookup->cancelled = true;
-        cache.orphaned_lookups.push_back(std::move(lookup));
+        peer_entry.pools.push_back(HandlePool{rpc_id, {handle}});
     }
-    cache.lookups.clear();
-    for (auto& [_, handles] : cache.handle_pools) {
-        for (auto handle : handles) {
-            (void) HG_Destroy(handle);
+
+    // Drop transport-level state for one peer while preserving any pending
+    // address lookup (the lookup callback will still need to find us).
+    void drop_peer(std::string_view peer) {
+        const auto it = peers.find(peer);
+        if (it == peers.end()) {
+            return;
+        }
+        for (auto& pool : it->second.pools) {
+            for (auto h : pool.handles) {
+                (void) HG_Destroy(h);
+            }
+        }
+        it->second.pools.clear();
+        if (it->second.addr != HG_ADDR_NULL) {
+            (void) HG_Addr_free(hg_class, it->second.addr);
+            it->second.addr = HG_ADDR_NULL;
+        }
+        if (!it->second.pending_lookup) {
+            peers.erase(it);
         }
     }
-    cache.handle_pools.clear();
-    for (auto& [_, addr] : cache.addrs) {
-        (void) HG_Addr_free(hg_class, addr);
+
+    // Tear down all peer state, failing any pending lookup waiters.
+    void clear_all_peers();
+
+    // Retrieve a lookup the user code expects to still be indexed. Returns
+    // nullptr if the lookup has been moved into `orphaned_lookups` already.
+    std::unique_ptr<LookupState> take_pending_lookup(std::string_view peer) {
+        const auto it = peers.find(peer);
+        if (it == peers.end() || !it->second.pending_lookup) {
+            return nullptr;
+        }
+        auto lookup = std::move(it->second.pending_lookup);
+        if (it->second.addr == HG_ADDR_NULL && it->second.pools.empty()) {
+            peers.erase(it);
+        }
+        return lookup;
     }
-    cache.addrs.clear();
-}
+
+    std::unique_ptr<LookupState> take_orphaned_lookup(LookupState* raw) {
+        const auto it = std::find_if(
+            orphaned_lookups.begin(), orphaned_lookups.end(),
+            [raw](const auto& p) { return p.get() == raw; });
+        if (it == orphaned_lookups.end()) {
+            return nullptr;
+        }
+        auto state = std::move(*it);
+        orphaned_lookups.erase(it);
+        return state;
+    }
+
+    // ----- per-call helpers -------------------------------------------------
+    void start_client_forward(std::unique_ptr<ClientRpcState> state);
+    void fail_client(std::unique_ptr<ClientRpcState> state, const std::string& msg);
+    void cleanup_client(ClientRpcState& state);
+    void respond_server(std::unique_ptr<ServerRpcState> state);
+    void run_server_handler(std::unique_ptr<ServerRpcState> state);
+    void cleanup_server_bulk(ServerRpcState& state);
+
+    // Called from the static dispatch callback after it resolves the shard.
+    int handle_rpc(hg_handle_t handle);
+
+    // ----- Mercury callbacks (static, required by Mercury C ABI) ------------
+    static hg_return_t forward_cb(const struct hg_cb_info* info);
+    static hg_return_t lookup_cb(const struct hg_cb_info* info);
+    static hg_return_t respond_cb(const struct hg_cb_info* info);
+    static hg_return_t bulk_pull_cb(const struct hg_cb_info* info);
+    static hg_return_t dispatch_cb(hg_handle_t handle);
+
+    // ----- progress loop ----------------------------------------------------
+    void arm_progress_timer(bool recently_active = false) {
+        if (running) {
+            progress_timer.arm(recently_active
+                ? kMercuryActiveProgressInterval
+                : kMercuryIdleProgressInterval);
+        }
+    }
+    bool progress_once();
+
+    // ----- state ------------------------------------------------------------
+    Impl()
+        : progress_timer([this] {
+              const bool progressed = progress_once();
+              arm_progress_timer(progressed);
+          }) {}
+
+    bool running{false};
+    std::string address;
+    seastar::timer<> progress_timer;
+
+    hg_class_t* hg_class{nullptr};
+    hg_context_t* hg_context{nullptr};
+
+    // Transparent string-view lookup avoids constructing a temporary string on
+    // every `forward(name, ...)` call.
+    std::unordered_map<std::string, std::unique_ptr<RpcEntry>,
+                       StringHash, std::equal_to<>> rpcs_by_name;
+    // Typically ≤ 3 registered RPCs; linear scan beats a hash table.
+    std::vector<std::pair<hg_id_t, RpcEntry*>> rpcs_by_id;
+    // Last RpcEntry resolved by name; a single pointer cache that skips the
+    // map lookup when the same RPC is called repeatedly (the common case).
+    RpcEntry* last_rpc_{nullptr};
+
+    std::unordered_map<std::string, PeerState,
+                       StringHash, std::equal_to<>> peers;
+    // Lookups that were in flight when stop() was called; kept alive until the
+    // Mercury callback fires. Linear size is bounded by peer count.
+    std::vector<std::unique_ptr<LookupState>> orphaned_lookups;
+
+    std::uint64_t rpc_forwards{0};
+    std::uint64_t rpc_receives{0};
+    std::uint64_t rpc_errors{0};
+    std::uint64_t rpc_timeouts{0};
+    std::uint64_t bulk_transfers{0};
+    std::uint64_t bulk_bytes{0};
+    std::uint64_t bulk_errors{0};
+    seastar::metrics::internal::time_estimated_histogram rpc_forward_latency;
+    seastar::metrics::internal::time_estimated_histogram rpc_handler_latency;
+    seastar::metrics::internal::time_estimated_histogram bulk_latency;
+#else
+    // Minimal stub members when Mercury support is compiled out. We still need
+    // the timer so that stop()/start() have consistent structure, but we never
+    // arm it.
+    Impl() = default;
+
+    bool running{false};
+    std::string address;
+    std::uint64_t rpc_forwards{0};
+    std::uint64_t rpc_receives{0};
+    std::uint64_t rpc_errors{0};
+    std::uint64_t rpc_timeouts{0};
+    std::uint64_t bulk_transfers{0};
+    std::uint64_t bulk_bytes{0};
+    std::uint64_t bulk_errors{0};
+    seastar::metrics::internal::time_estimated_histogram rpc_forward_latency;
+    seastar::metrics::internal::time_estimated_histogram rpc_handler_latency;
+    seastar::metrics::internal::time_estimated_histogram bulk_latency;
+    std::unordered_map<std::string, RpcHandler> deferred_handlers;
+#endif
+};
+
+#if MKMQ_HAVE_MERCURY
+
+// ---------------------------------------------------------------------------
+// Mercury <proc> codecs for our eager/bulk envelope.
+// ---------------------------------------------------------------------------
+namespace {
 
 hg_return_t proc_hg_bytes(hg_proc_t proc, void* data) {
     auto* bytes = static_cast<HgBytes*>(data);
@@ -337,26 +507,155 @@ hg_return_t proc_hg_request(hg_proc_t proc, void* data) {
     return HG_SUCCESS;
 }
 
-void cleanup_client_mercury_resources(ClientRpcState& state) {
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Impl method definitions.
+// ---------------------------------------------------------------------------
+
+void MercuryShard::Impl::bind_rpc_to_mercury(RpcEntry& entry) {
+    const auto id = HG_Register_name(
+        hg_class,
+        entry.name.c_str(),
+        proc_hg_request,
+        proc_hg_reply,
+        &Impl::dispatch_cb);
+    if (id == 0) {
+        throw std::runtime_error("HG_Register_name failed for " + entry.name);
+    }
+    const auto ret = HG_Register_data(hg_class, id, this, nullptr);
+    if (ret != HG_SUCCESS) {
+        throw std::runtime_error(std::string("HG_Register_data failed: ") + HG_Error_to_string(ret));
+    }
+    entry.id = id;
+    rpcs_by_id.push_back({id, &entry});
+}
+
+void MercuryShard::Impl::clear_all_peers() {
+    for (auto& [_, peer] : peers) {
+        if (peer.pending_lookup) {
+            auto lookup = std::move(peer.pending_lookup);
+            lookup->cancelled = true;
+            for (auto& waiter : lookup->waiters) {
+                if (!waiter->promise_done) {
+                    waiter->promise.set_exception(std::runtime_error(
+                        "Mercury shard stopped during address lookup"));
+                    waiter->promise_done = true;
+                }
+                cleanup_client(*waiter);
+            }
+            lookup->waiters.clear();
+            orphaned_lookups.push_back(std::move(lookup));
+        }
+        for (auto& pool : peer.pools) {
+            for (auto h : pool.handles) {
+                (void) HG_Destroy(h);
+            }
+        }
+        if (peer.addr != HG_ADDR_NULL) {
+            (void) HG_Addr_free(hg_class, peer.addr);
+        }
+    }
+    peers.clear();
+}
+
+void MercuryShard::Impl::cleanup_client(ClientRpcState& state) {
     if (state.origin_bulk != HG_BULK_NULL) {
         (void) HG_Bulk_free(state.origin_bulk);
         state.origin_bulk = HG_BULK_NULL;
     }
     if (state.handle != HG_HANDLE_NULL) {
-        if (state.recycle_handle && state.shard != nullptr && !state.handle_pool_key.empty()) {
-            recycle_cached_handle(state.shard, state.handle_pool_key, state.handle);
+        if (state.recycle_handle) {
+            recycle_handle(state.peer, state.rpc_id, state.handle);
         } else {
             (void) HG_Destroy(state.handle);
         }
         state.handle = HG_HANDLE_NULL;
     }
-    if (state.drop_peer_cache && state.shard != nullptr) {
-        drop_peer_cache(state.shard, state.hg_class, state.peer);
+    if (state.drop_peer_on_cleanup) {
+        drop_peer(state.peer);
     }
     state.addr = HG_ADDR_NULL;
 }
 
-void cleanup_server_bulk_resources(ServerRpcState& state) {
+void MercuryShard::Impl::fail_client(std::unique_ptr<ClientRpcState> state, const std::string& msg) {
+    state->timeout_timer.cancel();
+    if (!state->promise_done) {
+        state->promise.set_exception(std::runtime_error(msg));
+        state->promise_done = true;
+    }
+    on_rpc_error();
+    record_forward_latency_if_needed(*state);
+    cleanup_client(*state);
+}
+
+void MercuryShard::Impl::start_client_forward(std::unique_ptr<ClientRpcState> state) {
+    if (state->promise_done) {
+        cleanup_client(*state);
+        return;
+    }
+
+    auto& peer = peer_state(state->peer);
+    state->handle = take_cached_handle(peer, state->rpc_id);
+    if (state->handle != HG_HANDLE_NULL) {
+        if (HG_Reset(state->handle, state->addr, state->rpc_id) != HG_SUCCESS) {
+            (void) HG_Destroy(state->handle);
+            state->handle = HG_HANDLE_NULL;
+        }
+    }
+    if (state->handle == HG_HANDLE_NULL) {
+        const auto ret = HG_Create(hg_context, state->addr, state->rpc_id, &state->handle);
+        if (ret != HG_SUCCESS) {
+            state->drop_peer_on_cleanup = true;
+            fail_client(std::move(state), std::string("HG_Create failed: ") + HG_Error_to_string(ret));
+            return;
+        }
+    }
+
+    const auto ret = HG_Forward(state->handle, &Impl::forward_cb, state.get(), &state->input);
+    if (ret != HG_SUCCESS) {
+        state->drop_peer_on_cleanup = true;
+        fail_client(std::move(state), std::string("HG_Forward failed: ") + HG_Error_to_string(ret));
+        return;
+    }
+    state->timeout_timer.arm(kForwardTimeout);
+    (void) state.release();  // Ownership passes to mercury_forward_cb.
+
+    // Kick the transport immediately so the request goes on the wire without
+    // waiting up to the next progress-timer tick (≈1 µs). The progress timer
+    // will still run; this is purely a latency optimization on the fast path.
+    (void) HG_Progress(hg_context, 0);
+}
+
+void MercuryShard::Impl::respond_server(std::unique_ptr<ServerRpcState> state) {
+    record_handler_latency(*state);
+    state->output.payload.size = static_cast<hg_size_t>(state->response.size());
+    state->output.payload.data = state->response.empty() ? nullptr : state->response.data();
+    const auto ret = HG_Respond(state->handle, &Impl::respond_cb, state.get(), &state->output);
+    if (ret == HG_SUCCESS) {
+        (void) state.release();  // Ownership passes to mercury_respond_cb.
+    } else if (state->handle != HG_HANDLE_NULL) {
+        (void) HG_Destroy(state->handle);
+    }
+}
+
+void MercuryShard::Impl::run_server_handler(std::unique_ptr<ServerRpcState> state) {
+    auto& handler = state->rpc->handler;
+    (void) handler(std::move(state->request)).then_wrapped(
+        [this, state = std::move(state)](seastar::future<std::vector<std::uint8_t>> fut) mutable {
+            try {
+                state->response = fut.get();
+                state->output.status = 0;
+            } catch (...) {
+                state->response.clear();
+                state->output.status = -1;
+                on_rpc_error();
+            }
+            respond_server(std::move(state));
+        }).handle_exception([](std::exception_ptr) {});
+}
+
+void MercuryShard::Impl::cleanup_server_bulk(ServerRpcState& state) {
     if (state.local_bulk != HG_BULK_NULL) {
         (void) HG_Bulk_free(state.local_bulk);
         state.local_bulk = HG_BULK_NULL;
@@ -367,198 +666,214 @@ void cleanup_server_bulk_resources(ServerRpcState& state) {
     }
 }
 
-void respond_server_rpc(std::unique_ptr<ServerRpcState> state) {
-    if (state->handler_latency != nullptr) {
-        state->handler_latency->add(std::chrono::steady_clock::now() - state->started);
+int MercuryShard::Impl::handle_rpc(hg_handle_t handle) {
+    on_rpc_receive();
+    const auto started = std::chrono::steady_clock::now();
+    const auto* info = HG_Get_info(handle);
+    if (info == nullptr) {
+        on_rpc_error();
+        (void) HG_Destroy(handle);
+        return HG_INVALID_ARG;
     }
-    state->output.payload.size = static_cast<hg_size_t>(state->response.size());
-    state->output.payload.data = state->response.empty() ? nullptr : state->response.data();
-    const auto respond_ret = HG_Respond(
-        state->handle,
-        mercury_respond_cb,
-        state.get(),
-        &state->output);
-    if (respond_ret == HG_SUCCESS) {
-        (void) state.release();
-    } else if (state->handle != HG_HANDLE_NULL) {
-        (void) HG_Destroy(state->handle);
+    auto* rpc = find_rpc_by_id(info->id);
+    if (rpc == nullptr || !rpc->handler) {
+        on_rpc_error();
+        (void) HG_Destroy(handle);
+        return HG_NOENTRY;
     }
-}
 
-void run_server_handler(std::unique_ptr<ServerRpcState> state, MercuryShard::RpcHandler* handler) {
-    (void) (*handler)(std::move(state->request)).then_wrapped(
-        [state = std::move(state)](seastar::future<std::vector<std::uint8_t>> result) mutable {
-            try {
-                state->response = result.get();
-                state->output.status = 0;
-            } catch (...) {
-                state->response.clear();
-                state->output.status = -1;
-                if (state->rpc_errors != nullptr) {
-                    ++*state->rpc_errors;
-                }
-            }
-            respond_server_rpc(std::move(state));
-        }).handle_exception([](std::exception_ptr) {});
-}
+    auto state = std::make_unique<ServerRpcState>(this);
+    state->handle = handle;
+    state->rpc = rpc;
+    state->started = started;
 
-hg_return_t mercury_bulk_pull_cb(const struct hg_cb_info* info) {
-    std::unique_ptr<ServerRpcState> state(static_cast<ServerRpcState*>(info->arg));
-    if (state->bulk_latency != nullptr) {
-        state->bulk_latency->add(std::chrono::steady_clock::now() - state->started);
+    auto ret = HG_Get_input(handle, &state->input);
+    if (ret != HG_SUCCESS) {
+        on_rpc_error();
+        (void) HG_Destroy(handle);
+        return ret;
     }
-    if (info->ret == HG_SUCCESS) {
-        if (state->bulk_transfers != nullptr) {
-            ++*state->bulk_transfers;
+    state->input_loaded = true;
+
+    if (state->input.mode != static_cast<std::int32_t>(HgTransferMode::Bulk)) {
+        const auto* bytes = static_cast<const std::uint8_t*>(state->input.eager.data);
+        if (bytes != nullptr && state->input.eager.size > 0) {
+            state->request.assign(bytes, bytes + static_cast<std::size_t>(state->input.eager.size));
         }
-        if (state->bulk_bytes != nullptr) {
-            *state->bulk_bytes += static_cast<std::uint64_t>(state->request.size());
-        }
-    } else {
-        state->request.clear();
-        state->response.clear();
+        cleanup_server_bulk(*state);
+        run_server_handler(std::move(state));
+        return HG_SUCCESS;
+    }
+
+    // Bulk pull path: fail fast on a malformed descriptor, otherwise stage a
+    // local buffer and issue a pull.
+    if (state->input.bulk_size == 0 || state->input.bulk_handle == HG_BULK_NULL) {
+        on_rpc_error();
+        on_bulk_error();
+        cleanup_server_bulk(*state);
         state->output.status = -1;
-        if (state->rpc_errors != nullptr) {
-            ++*state->rpc_errors;
+        respond_server(std::move(state));
+        return HG_SUCCESS;
+    }
+    state->request.resize(static_cast<std::size_t>(state->input.bulk_size));
+    void* buffer = state->request.data();
+    const hg_size_t size = state->input.bulk_size;
+    ret = HG_Bulk_create(hg_class, 1, &buffer, &size, HG_BULK_WRITE_ONLY, &state->local_bulk);
+    if (ret != HG_SUCCESS) {
+        on_rpc_error();
+        on_bulk_error();
+        cleanup_server_bulk(*state);
+        state->output.status = -1;
+        respond_server(std::move(state));
+        return HG_SUCCESS;
+    }
+    ret = HG_Bulk_transfer(
+        hg_context,
+        &Impl::bulk_pull_cb,
+        state.get(),
+        HG_BULK_PULL,
+        info->addr,
+        state->input.bulk_handle,
+        0,
+        state->local_bulk,
+        0,
+        size,
+        HG_OP_ID_IGNORE);
+    if (ret != HG_SUCCESS) {
+        on_rpc_error();
+        on_bulk_error();
+        cleanup_server_bulk(*state);
+        state->output.status = -1;
+        respond_server(std::move(state));
+        return HG_SUCCESS;
+    }
+    (void) state.release();  // Ownership passes to mercury_bulk_pull_cb.
+    return HG_SUCCESS;
+}
+
+bool MercuryShard::Impl::progress_once() {
+    if (!running || hg_context == nullptr) {
+        return false;
+    }
+    bool progressed = false;
+    unsigned int actual_count = 0;
+    for (std::size_t round = 0; round < kMercuryProgressRounds; ++round) {
+        bool triggered = false;
+        do {
+            const auto ret = HG_Trigger(hg_context, 0, kMercuryTriggerBatch, &actual_count);
+            if (ret != HG_SUCCESS) {
+                actual_count = 0;
+                break;
+            }
+            if (actual_count > 0) {
+                triggered = true;
+                progressed = true;
+            }
+        } while (actual_count > 0);
+
+        if (HG_Progress(hg_context, 0) == HG_SUCCESS) {
+            progressed = true;
+            continue;
         }
-        if (state->bulk_errors != nullptr) {
-            ++*state->bulk_errors;
+        if (!triggered) {
+            break;
         }
     }
-    cleanup_server_bulk_resources(*state);
-    auto* handler = state->handler;
-    if (info->ret == HG_SUCCESS && handler != nullptr) {
-        run_server_handler(std::move(state), handler);
-    } else {
-        respond_server_rpc(std::move(state));
+    return progressed;
+}
+
+// ---------------------------------------------------------------------------
+// Static Mercury callbacks — defined as Impl members so they can touch its
+// private nested types. Each is called from Mercury's progress loop.
+// ---------------------------------------------------------------------------
+
+hg_return_t MercuryShard::Impl::respond_cb(const struct hg_cb_info* info) {
+    std::unique_ptr<ServerRpcState> state(static_cast<ServerRpcState*>(info->arg));
+    if (state->handle != HG_HANDLE_NULL) {
+        (void) HG_Destroy(state->handle);
     }
     return HG_SUCCESS;
 }
 
-void fail_client_rpc(std::unique_ptr<ClientRpcState> state, const std::string& message) {
-    state->timeout_timer.cancel();
-    if (!state->promise_done) {
-        state->promise.set_exception(std::runtime_error(message));
-        state->promise_done = true;
-    }
-    if (state->rpc_errors != nullptr) {
-        ++*state->rpc_errors;
-    }
-    if (state->forward_latency != nullptr && !state->latency_recorded) {
-        state->forward_latency->add(std::chrono::steady_clock::now() - state->started);
-        state->latency_recorded = true;
-    }
-    cleanup_client_mercury_resources(*state);
-}
-
-void start_client_forward(std::unique_ptr<ClientRpcState> state) {
-    if (state->promise_done) {
-        cleanup_client_mercury_resources(*state);
-        return;
-    }
-
-    state->handle_pool_key = handle_pool_key(state->peer, state->rpc_id);
-    state->handle = take_cached_handle(state->shard, state->handle_pool_key);
-    if (state->handle != HG_HANDLE_NULL) {
-        const auto reset_ret = HG_Reset(state->handle, state->addr, state->rpc_id);
-        if (reset_ret != HG_SUCCESS) {
-            (void) HG_Destroy(state->handle);
-            state->handle = HG_HANDLE_NULL;
-        }
-    }
-    if (state->handle == HG_HANDLE_NULL) {
-        auto ret = HG_Create(state->hg_context, state->addr, state->rpc_id, &state->handle);
-        if (ret != HG_SUCCESS) {
-            state->drop_peer_cache = true;
-            fail_client_rpc(std::move(state), std::string("HG_Create failed: ") + HG_Error_to_string(ret));
-            return;
-        }
-    }
-
-    auto ret = HG_Forward(state->handle, mercury_forward_cb, state.get(), &state->input);
-    if (ret != HG_SUCCESS) {
-        state->drop_peer_cache = true;
-        fail_client_rpc(std::move(state), std::string("HG_Forward failed: ") + HG_Error_to_string(ret));
-        return;
-    }
-    state->timeout_timer.arm(std::chrono::milliseconds(100));
-    (void) state.release();
-}
-
-hg_return_t mercury_dispatch_cb(hg_handle_t handle) {
-    const auto* info = HG_Get_info(handle);
-    if (info == nullptr) {
-        HG_Destroy(handle);
-        return HG_INVALID_ARG;
-    }
-    auto* shard = static_cast<MercuryShard*>(HG_Registered_data(info->hg_class, info->id));
-    if (shard == nullptr) {
-        HG_Destroy(handle);
-        return HG_NOENTRY;
-    }
-    return static_cast<hg_return_t>(shard->handle_mercury_rpc(handle));
-}
-
-hg_return_t mercury_forward_cb(const struct hg_cb_info* info) {
-    std::unique_ptr<ClientRpcState> state(static_cast<ClientRpcState*>(info->arg));
-    state->timeout_timer.cancel();
-    if (info->ret != HG_SUCCESS) {
-        state->drop_peer_cache = true;
-    }
-    if (state->promise_done) {
-        // The Seastar caller already saw a timeout; just release Mercury resources.
-    } else if (info->ret != HG_SUCCESS) {
-        state->promise.set_exception(std::runtime_error(
-            std::string("HG_Forward failed: ") + HG_Error_to_string(info->ret)));
-        state->promise_done = true;
-        if (state->rpc_errors != nullptr) {
-            ++*state->rpc_errors;
-        }
+hg_return_t MercuryShard::Impl::bulk_pull_cb(const struct hg_cb_info* info) {
+    std::unique_ptr<ServerRpcState> state(static_cast<ServerRpcState*>(info->arg));
+    auto* impl = state->impl;
+    impl->record_bulk_latency(*state);
+    if (info->ret == HG_SUCCESS) {
+        impl->on_bulk_transfer(static_cast<std::uint64_t>(state->request.size()));
     } else {
+        state->request.clear();
+        state->response.clear();
+        state->output.status = -1;
+        impl->on_rpc_error();
+        impl->on_bulk_error();
+    }
+    impl->cleanup_server_bulk(*state);
+    if (info->ret == HG_SUCCESS && state->rpc != nullptr && state->rpc->handler) {
+        impl->run_server_handler(std::move(state));
+    } else {
+        impl->respond_server(std::move(state));
+    }
+    return HG_SUCCESS;
+}
+
+hg_return_t MercuryShard::Impl::forward_cb(const struct hg_cb_info* info) {
+    std::unique_ptr<ClientRpcState> state(static_cast<ClientRpcState*>(info->arg));
+    auto* impl = state->impl;
+    state->timeout_timer.cancel();
+
+    const bool already_failed = state->promise_done;
+    if (info->ret != HG_SUCCESS) {
+        state->drop_peer_on_cleanup = true;
+        if (!already_failed) {
+            state->promise.set_exception(std::runtime_error(
+                std::string("HG_Forward failed: ") + HG_Error_to_string(info->ret)));
+            state->promise_done = true;
+            impl->on_rpc_error();
+        }
+    } else if (!already_failed) {
+        // Forward succeeded at the transport level — decode the reply.
         const auto ret = HG_Get_output(info->info.forward.handle, &state->output);
         if (ret != HG_SUCCESS) {
             state->promise.set_exception(std::runtime_error(
                 std::string("HG_Get_output failed: ") + HG_Error_to_string(ret)));
             state->promise_done = true;
-            if (state->rpc_errors != nullptr) {
-                ++*state->rpc_errors;
-            }
-        } else if (state->output.status != 0) {
-            state->promise.set_exception(std::runtime_error("remote Mercury RPC handler failed"));
-            state->promise_done = true;
-            if (state->rpc_errors != nullptr) {
-                ++*state->rpc_errors;
-            }
+            impl->on_rpc_error();
         } else {
-            const auto* begin = static_cast<const std::uint8_t*>(state->output.payload.data);
-            std::vector<std::uint8_t> response;
-            if (begin != nullptr && state->output.payload.size > 0) {
-                response.assign(begin, begin + static_cast<std::size_t>(state->output.payload.size));
+            if (state->output.status != 0) {
+                state->promise.set_exception(
+                    std::runtime_error("remote Mercury RPC handler failed"));
+                impl->on_rpc_error();
+            } else {
+                const auto* begin = static_cast<const std::uint8_t*>(state->output.payload.data);
+                std::vector<std::uint8_t> response;
+                if (begin != nullptr && state->output.payload.size > 0) {
+                    response.assign(begin,
+                        begin + static_cast<std::size_t>(state->output.payload.size));
+                }
+                state->promise.set_value(std::move(response));
             }
-            state->promise.set_value(std::move(response));
             state->promise_done = true;
-        }
-        if (ret == HG_SUCCESS) {
             (void) HG_Free_output(info->info.forward.handle, &state->output);
         }
         state->recycle_handle = true;
-    }
-    if (state->promise_done && info->ret == HG_SUCCESS) {
+    } else {
+        // Caller already saw a timeout; the Mercury handle is still reusable
+        // since the forward itself succeeded.
         state->recycle_handle = true;
     }
-    if (!state->latency_recorded && state->forward_latency != nullptr) {
-        state->forward_latency->add(std::chrono::steady_clock::now() - state->started);
-        state->latency_recorded = true;
-    }
-    cleanup_client_mercury_resources(*state);
+
+    impl->record_forward_latency_if_needed(*state);
+    impl->cleanup_client(*state);
     return HG_SUCCESS;
 }
 
-hg_return_t mercury_lookup_cb(const struct hg_cb_info* info) {
-    auto* raw_lookup = static_cast<LookupState*>(info->arg);
-    auto lookup = take_lookup_state(raw_lookup->shard, raw_lookup->peer);
+hg_return_t MercuryShard::Impl::lookup_cb(const struct hg_cb_info* info) {
+    auto* raw = static_cast<LookupState*>(info->arg);
+    auto* impl = raw->impl;
+    auto lookup = impl->take_pending_lookup(raw->peer);
     if (!lookup) {
-        lookup = take_orphaned_lookup_state(raw_lookup);
+        lookup = impl->take_orphaned_lookup(raw);
         if (!lookup) {
             return HG_SUCCESS;
         }
@@ -568,199 +883,187 @@ hg_return_t mercury_lookup_cb(const struct hg_cb_info* info) {
     }
 
     if (info->ret != HG_SUCCESS) {
+        const std::string msg = std::string("HG_Addr_lookup failed: ") + HG_Error_to_string(info->ret);
         for (auto& waiter : lookup->waiters) {
-            fail_client_rpc(std::move(waiter), std::string("HG_Addr_lookup failed: ") + HG_Error_to_string(info->ret));
+            impl->fail_client(std::move(waiter), msg);
         }
         return HG_SUCCESS;
     }
 
-    const auto addr = cache_peer_addr(lookup->shard, lookup->hg_class, lookup->peer, info->info.lookup.addr);
+    // Success: cache the resolved address and fan out to all pending waiters.
+    auto& peer = impl->peer_state(lookup->peer);
+    if (peer.addr == HG_ADDR_NULL) {
+        peer.addr = info->info.lookup.addr;
+    } else if (info->info.lookup.addr != peer.addr) {
+        (void) HG_Addr_free(impl->hg_class, info->info.lookup.addr);
+    }
     for (auto& waiter : lookup->waiters) {
-        waiter->addr = addr;
-        start_client_forward(std::move(waiter));
+        waiter->addr = peer.addr;
+        impl->start_client_forward(std::move(waiter));
     }
     return HG_SUCCESS;
 }
 
-hg_return_t mercury_respond_cb(const struct hg_cb_info* info) {
-    std::unique_ptr<ServerRpcState> state(static_cast<ServerRpcState*>(info->arg));
-    (void) info;
-    if (state->handle != HG_HANDLE_NULL) {
-        (void) HG_Destroy(state->handle);
+hg_return_t MercuryShard::Impl::dispatch_cb(hg_handle_t handle) {
+    const auto* info = HG_Get_info(handle);
+    if (info == nullptr) {
+        HG_Destroy(handle);
+        return HG_INVALID_ARG;
     }
-    return HG_SUCCESS;
+    auto* impl = static_cast<Impl*>(HG_Registered_data(info->hg_class, info->id));
+    if (impl == nullptr) {
+        HG_Destroy(handle);
+        return HG_NOENTRY;
+    }
+    return static_cast<hg_return_t>(impl->handle_rpc(handle));
 }
 
-#endif
+#endif  // MKMQ_HAVE_MERCURY
 
-}  // namespace
+// ---------------------------------------------------------------------------
+// MercuryShard public API — all methods forward to Impl.
+// ---------------------------------------------------------------------------
 
-MercuryShard::MercuryShard()
-    : progress_timer_([this] {
-          const bool progressed = progress_once();
-          arm_progress_timer(progressed);
-      })
-#if MKMQ_HAVE_MERCURY
-    , client_cache_(new MercuryClientCache())
-#endif
-{}
-
-MercuryShard::~MercuryShard() {
-#if MKMQ_HAVE_MERCURY
-    delete static_cast<MercuryClientCache*>(client_cache_);
-#endif
-    client_cache_ = nullptr;
-}
+MercuryShard::MercuryShard() : impl_(std::make_unique<Impl>()) {}
+MercuryShard::~MercuryShard() = default;
 
 seastar::future<> MercuryShard::start(std::string address, bool listen) {
-    if (running_) {
+    auto& impl = *impl_;
+    if (impl.running) {
         return seastar::make_ready_future<>();
     }
 #if MKMQ_HAVE_MERCURY
-    hg_class_ = HG_Init(address.c_str(), listen ? HG_TRUE : HG_FALSE);
-    if (hg_class_ == nullptr) {
-        return seastar::make_exception_future<>(std::runtime_error("HG_Init failed for " + address));
+    impl.hg_class = HG_Init(address.c_str(), listen ? HG_TRUE : HG_FALSE);
+    if (impl.hg_class == nullptr) {
+        return seastar::make_exception_future<>(
+            std::runtime_error("HG_Init failed for " + address));
     }
-    hg_context_ = HG_Context_create(static_cast<hg_class_t*>(hg_class_));
-    if (hg_context_ == nullptr) {
-        HG_Finalize(static_cast<hg_class_t*>(hg_class_));
-        hg_class_ = nullptr;
+    impl.hg_context = HG_Context_create(impl.hg_class);
+    if (impl.hg_context == nullptr) {
+        HG_Finalize(impl.hg_class);
+        impl.hg_class = nullptr;
         return seastar::make_exception_future<>(std::runtime_error("HG_Context_create failed"));
     }
-#else
-    (void) address;
-    (void) listen;
-#endif
-    address_ = std::move(address);
-    running_ = true;
-    for (const auto& [name, _] : handlers_) {
-        register_mercury_rpc(name);
+    impl.address = std::move(address);
+    impl.running = true;
+    // Register any handlers that were added before start().
+    for (auto& [_, entry] : impl.rpcs_by_name) {
+        if (entry->id == 0) {
+            impl.bind_rpc_to_mercury(*entry);
+        }
     }
-    arm_progress_timer();
+    impl.arm_progress_timer();
+#else
+    (void) listen;
+    impl.address = std::move(address);
+    impl.running = true;
+#endif
     return seastar::make_ready_future<>();
 }
 
 seastar::future<> MercuryShard::stop() {
-    if (!running_) {
+    auto& impl = *impl_;
+    if (!impl.running) {
         return seastar::make_ready_future<>();
     }
-    running_ = false;
-    progress_timer_.cancel();
+    impl.running = false;
 #if MKMQ_HAVE_MERCURY
-    if (hg_class_ != nullptr) {
-        clear_client_cache(this, static_cast<hg_class_t*>(hg_class_));
+    impl.progress_timer.cancel();
+    if (impl.hg_class != nullptr) {
+        impl.clear_all_peers();
     }
-    if (hg_context_ != nullptr) {
-        HG_Context_destroy(static_cast<hg_context_t*>(hg_context_));
-        hg_context_ = nullptr;
+    if (impl.hg_context != nullptr) {
+        HG_Context_destroy(impl.hg_context);
+        impl.hg_context = nullptr;
     }
-    if (hg_class_ != nullptr) {
-        HG_Finalize(static_cast<hg_class_t*>(hg_class_));
-        hg_class_ = nullptr;
+    if (impl.hg_class != nullptr) {
+        HG_Finalize(impl.hg_class);
+        impl.hg_class = nullptr;
     }
-    rpc_ids_.clear();
-    rpc_names_.clear();
+    impl.rpcs_by_id.clear();
+    impl.last_rpc_ = nullptr;
+    // Leave rpcs_by_name populated so that a subsequent start() re-registers
+    // the same handlers; we just clear their Mercury ids.
+    for (auto& [_, entry] : impl.rpcs_by_name) {
+        entry->id = 0;
+    }
 #endif
     return seastar::make_ready_future<>();
 }
 
-bool MercuryShard::running() const noexcept {
-    return running_;
-}
-
-std::uint64_t MercuryShard::rpc_forwards() const noexcept {
-    return rpc_forwards_;
-}
-
-std::uint64_t MercuryShard::rpc_receives() const noexcept {
-    return rpc_receives_;
-}
-
-std::uint64_t MercuryShard::rpc_errors() const noexcept {
-    return rpc_errors_;
-}
-
-std::uint64_t MercuryShard::rpc_timeouts() const noexcept {
-    return rpc_timeouts_;
-}
-
-std::uint64_t MercuryShard::bulk_transfers() const noexcept {
-    return bulk_transfers_;
-}
-
-std::uint64_t MercuryShard::bulk_bytes() const noexcept {
-    return bulk_bytes_;
-}
-
-std::uint64_t MercuryShard::bulk_errors() const noexcept {
-    return bulk_errors_;
-}
+bool MercuryShard::running() const noexcept { return impl_->running; }
+std::uint64_t MercuryShard::rpc_forwards() const noexcept { return impl_->rpc_forwards; }
+std::uint64_t MercuryShard::rpc_receives() const noexcept { return impl_->rpc_receives; }
+std::uint64_t MercuryShard::rpc_errors() const noexcept { return impl_->rpc_errors; }
+std::uint64_t MercuryShard::rpc_timeouts() const noexcept { return impl_->rpc_timeouts; }
+std::uint64_t MercuryShard::bulk_transfers() const noexcept { return impl_->bulk_transfers; }
+std::uint64_t MercuryShard::bulk_bytes() const noexcept { return impl_->bulk_bytes; }
+std::uint64_t MercuryShard::bulk_errors() const noexcept { return impl_->bulk_errors; }
 
 seastar::metrics::internal::time_estimated_histogram MercuryShard::rpc_forward_latency() const {
-    return rpc_forward_latency_;
+    return impl_->rpc_forward_latency;
 }
-
 seastar::metrics::internal::time_estimated_histogram MercuryShard::rpc_handler_latency() const {
-    return rpc_handler_latency_;
+    return impl_->rpc_handler_latency;
 }
-
 seastar::metrics::internal::time_estimated_histogram MercuryShard::bulk_latency() const {
-    return bulk_latency_;
+    return impl_->bulk_latency;
 }
 
-void MercuryShard::register_rpc(std::string name, RpcHandler handler) {
-    auto rpc_name = std::move(name);
-    handlers_[rpc_name] = std::move(handler);
-    if (running_) {
-        register_mercury_rpc(rpc_name);
-    }
+void MercuryShard::register_rpc(std::string_view name, RpcHandler handler) {
+#if MKMQ_HAVE_MERCURY
+    impl_->register_handler(name, std::move(handler));
+#else
+    impl_->deferred_handlers.emplace(std::string(name), std::move(handler));
+#endif
 }
 
 seastar::future<std::vector<std::uint8_t>> MercuryShard::forward(
-    std::string peer,
-    std::string rpc,
+    std::string_view peer,
+    std::string_view rpc,
     std::vector<std::uint8_t> payload) {
 #if MKMQ_HAVE_MERCURY
-    if (peer == address_) {
-        const auto it = handlers_.find(rpc);
-        if (it == handlers_.end()) {
+    auto& impl = *impl_;
+
+    // Loopback fast-path: invoke the local handler without touching Mercury.
+    if (peer == impl.address) {
+        auto* entry = impl.find_rpc_by_name(rpc);
+        if (entry == nullptr || !entry->handler) {
             return seastar::make_exception_future<std::vector<std::uint8_t>>(
-                std::runtime_error("Mercury RPC is not registered: " + rpc));
+                std::runtime_error("Mercury RPC is not registered: " + std::string(rpc)));
         }
-        return it->second(std::move(payload));
+        return entry->handler(std::move(payload));
     }
 
-    if (!running_ || hg_class_ == nullptr || hg_context_ == nullptr) {
+    if (!impl.running || impl.hg_class == nullptr || impl.hg_context == nullptr) {
         return seastar::make_exception_future<std::vector<std::uint8_t>>(
             std::runtime_error("Mercury shard is not running"));
     }
 
-    if (rpc_ids_.find(rpc) == rpc_ids_.end()) {
-        register_mercury_rpc(rpc);
+    auto* entry = impl.find_rpc_by_name(rpc);
+    if (entry == nullptr) {
+        // An RPC we've never seen on this shard — reserve an id for it so
+        // that the dispatch table on the peer side matches.
+        impl.register_handler(rpc, RpcHandler{});
+        entry = impl.find_rpc_by_name(rpc);
     }
-    const auto rpc_id = static_cast<hg_id_t>(rpc_ids_.at(rpc));
+    if (entry->id == 0) {
+        impl.bind_rpc_to_mercury(*entry);
+    }
 
-    ++rpc_forwards_;
-    auto state = std::make_unique<ClientRpcState>();
+    impl.on_rpc_forward();
+    auto state = std::make_unique<Impl::ClientRpcState>(&impl);
     state->started = std::chrono::steady_clock::now();
-    state->hg_class = static_cast<hg_class_t*>(hg_class_);
-    state->hg_context = static_cast<hg_context_t*>(hg_context_);
-    state->shard = this;
-    state->rpc_id = rpc_id;
-    state->peer = peer;
+    state->rpc_id = entry->id;
+    state->peer = std::string(peer);  // single copy; reused for peer map lookups below
     state->request = std::move(payload);
     if (state->request.size() >= kBulkTransferThreshold) {
         void* buffer = state->request.data();
         const hg_size_t size = static_cast<hg_size_t>(state->request.size());
         const auto bulk_ret = HG_Bulk_create(
-            state->hg_class,
-            1,
-            &buffer,
-            &size,
-            HG_BULK_READ_ONLY,
-            &state->origin_bulk);
+            impl.hg_class, 1, &buffer, &size, HG_BULK_READ_ONLY, &state->origin_bulk);
         if (bulk_ret != HG_SUCCESS) {
-            ++rpc_errors_;
+            impl.on_rpc_error();
             return seastar::make_exception_future<std::vector<std::uint8_t>>(
                 std::runtime_error(std::string("HG_Bulk_create failed: ") + HG_Error_to_string(bulk_ret)));
         }
@@ -772,46 +1075,40 @@ seastar::future<std::vector<std::uint8_t>> MercuryShard::forward(
         state->input.eager.size = static_cast<hg_size_t>(state->request.size());
         state->input.eager.data = state->request.empty() ? nullptr : state->request.data();
     }
-    state->rpc_errors = &rpc_errors_;
-    state->rpc_timeouts = &rpc_timeouts_;
-    state->forward_latency = &rpc_forward_latency_;
     auto future = state->promise.get_future();
 
-    if (auto addr = cached_peer_addr(this, state->peer); addr != HG_ADDR_NULL) {
-        state->addr = addr;
-        start_client_forward(std::move(state));
+    // Fast path: resolved address already cached.
+    auto& peer_entry = impl.peer_state(state->peer);
+    if (peer_entry.addr != HG_ADDR_NULL) {
+        state->addr = peer_entry.addr;
+        impl.start_client_forward(std::move(state));
         return future;
     }
 
-    auto& cache = mercury_client_cache(this);
-    auto lookup_it = cache.lookups.find(peer);
-    if (lookup_it != cache.lookups.end()) {
-        lookup_it->second->waiters.push_back(std::move(state));
+    // Coalesce concurrent lookups onto a single in-flight request.
+    if (peer_entry.pending_lookup) {
+        peer_entry.pending_lookup->waiters.push_back(std::move(state));
         return future;
     }
 
-    auto lookup = std::make_unique<LookupState>();
-    lookup->shard = this;
-    lookup->hg_class = static_cast<hg_class_t*>(hg_class_);
-    lookup->hg_context = static_cast<hg_context_t*>(hg_context_);
-    lookup->peer = peer;
+    auto lookup = std::make_unique<Impl::LookupState>();
+    lookup->impl = &impl;
+    lookup->peer = state->peer;
     lookup->waiters.push_back(std::move(state));
     auto* raw_lookup = lookup.get();
-    cache.lookups.emplace(peer, std::move(lookup));
-    auto ret = HG_Addr_lookup(
-        static_cast<hg_context_t*>(hg_context_),
-        mercury_lookup_cb,
-        raw_lookup,
-        peer.c_str(),
-        HG_OP_ID_IGNORE);
+    peer_entry.pending_lookup = std::move(lookup);
+
+    const auto ret = HG_Addr_lookup(
+        impl.hg_context, &Impl::lookup_cb, raw_lookup,
+        raw_lookup->peer.c_str(), HG_OP_ID_IGNORE);
     if (ret != HG_SUCCESS) {
-        auto failed_lookup = take_lookup_state(this, peer);
-        if (failed_lookup) {
-            for (auto& waiter : failed_lookup->waiters) {
-                fail_client_rpc(std::move(waiter), std::string("HG_Addr_lookup failed: ") + HG_Error_to_string(ret));
+        auto failed = impl.take_pending_lookup(raw_lookup->peer);
+        if (failed) {
+            const std::string msg = std::string("HG_Addr_lookup failed: ") + HG_Error_to_string(ret);
+            for (auto& waiter : failed->waiters) {
+                impl.fail_client(std::move(waiter), msg);
             }
         }
-        return future;
     }
     return future;
 #else
@@ -820,184 +1117,6 @@ seastar::future<std::vector<std::uint8_t>> MercuryShard::forward(
     (void) payload;
     return seastar::make_exception_future<std::vector<std::uint8_t>>(
         std::runtime_error("Mercury support is disabled in this build"));
-#endif
-}
-
-void MercuryShard::arm_progress_timer(bool recently_active) {
-    if (running_) {
-        progress_timer_.arm(recently_active ? kMercuryActiveProgressInterval : kMercuryIdleProgressInterval);
-    }
-}
-
-bool MercuryShard::progress_once() {
-#if MKMQ_HAVE_MERCURY
-    if (!running_ || hg_context_ == nullptr) {
-        return false;
-    }
-    bool progressed = false;
-    unsigned int actual_count = 0;
-    for (std::size_t round = 0; round < kMercuryProgressRounds; ++round) {
-        bool triggered = false;
-        do {
-            const auto ret = HG_Trigger(
-                static_cast<hg_context_t*>(hg_context_),
-                0,
-                kMercuryTriggerBatch,
-                &actual_count);
-            if (ret != HG_SUCCESS) {
-                actual_count = 0;
-                break;
-            }
-            if (actual_count > 0) {
-                triggered = true;
-                progressed = true;
-            }
-        } while (actual_count > 0);
-
-        const auto progress_ret = HG_Progress(static_cast<hg_context_t*>(hg_context_), 0);
-        if (progress_ret == HG_SUCCESS) {
-            progressed = true;
-            continue;
-        }
-        if (!triggered) {
-            break;
-        }
-    }
-    return progressed;
-#else
-    return false;
-#endif
-}
-
-void MercuryShard::register_mercury_rpc(const std::string& name) {
-#if MKMQ_HAVE_MERCURY
-    if (hg_class_ == nullptr || rpc_ids_.find(name) != rpc_ids_.end()) {
-        return;
-    }
-    const auto id = HG_Register_name(
-        static_cast<hg_class_t*>(hg_class_),
-        name.c_str(),
-        proc_hg_request,
-        proc_hg_reply,
-        mercury_dispatch_cb);
-    if (id == 0) {
-        throw std::runtime_error("HG_Register_name failed for " + name);
-    }
-    const auto ret = HG_Register_data(static_cast<hg_class_t*>(hg_class_), id, this, nullptr);
-    if (ret != HG_SUCCESS) {
-        throw std::runtime_error(std::string("HG_Register_data failed: ") + HG_Error_to_string(ret));
-    }
-    rpc_ids_[name] = static_cast<std::uint64_t>(id);
-    rpc_names_[static_cast<std::uint64_t>(id)] = name;
-#else
-    (void) name;
-#endif
-}
-
-int MercuryShard::handle_mercury_rpc(void* raw_handle) {
-#if MKMQ_HAVE_MERCURY
-    ++rpc_receives_;
-    const auto started = std::chrono::steady_clock::now();
-    auto handle = static_cast<hg_handle_t>(raw_handle);
-    const auto* info = HG_Get_info(handle);
-    if (info == nullptr) {
-        ++rpc_errors_;
-        (void) HG_Destroy(handle);
-        return HG_INVALID_ARG;
-    }
-    const auto name_it = rpc_names_.find(static_cast<std::uint64_t>(info->id));
-    if (name_it == rpc_names_.end()) {
-        ++rpc_errors_;
-        (void) HG_Destroy(handle);
-        return HG_NOENTRY;
-    }
-    const auto handler_it = handlers_.find(name_it->second);
-    if (handler_it == handlers_.end()) {
-        ++rpc_errors_;
-        (void) HG_Destroy(handle);
-        return HG_NOENTRY;
-    }
-
-    auto state = std::make_unique<ServerRpcState>();
-    state->handle = handle;
-    state->handler = &handler_it->second;
-    state->started = started;
-    state->handler_latency = &rpc_handler_latency_;
-    state->bulk_latency = &bulk_latency_;
-    state->rpc_errors = &rpc_errors_;
-    state->bulk_transfers = &bulk_transfers_;
-    state->bulk_bytes = &bulk_bytes_;
-    state->bulk_errors = &bulk_errors_;
-
-    auto ret = HG_Get_input(handle, &state->input);
-    if (ret != HG_SUCCESS) {
-        ++rpc_errors_;
-        (void) HG_Destroy(handle);
-        return ret;
-    }
-    state->input_loaded = true;
-
-    if (state->input.mode == static_cast<std::int32_t>(HgTransferMode::Bulk)) {
-        if (state->input.bulk_size == 0 || state->input.bulk_handle == HG_BULK_NULL) {
-            ++rpc_errors_;
-            ++bulk_errors_;
-            cleanup_server_bulk_resources(*state);
-            state->output.status = -1;
-            respond_server_rpc(std::move(state));
-            return HG_SUCCESS;
-        }
-        state->request.resize(static_cast<std::size_t>(state->input.bulk_size));
-        void* buffer = state->request.data();
-        const hg_size_t size = state->input.bulk_size;
-        ret = HG_Bulk_create(
-            static_cast<hg_class_t*>(hg_class_),
-            1,
-            &buffer,
-            &size,
-            HG_BULK_WRITE_ONLY,
-            &state->local_bulk);
-        if (ret != HG_SUCCESS) {
-            ++rpc_errors_;
-            ++bulk_errors_;
-            cleanup_server_bulk_resources(*state);
-            state->output.status = -1;
-            respond_server_rpc(std::move(state));
-            return HG_SUCCESS;
-        }
-        ret = HG_Bulk_transfer(
-            static_cast<hg_context_t*>(hg_context_),
-            mercury_bulk_pull_cb,
-            state.get(),
-            HG_BULK_PULL,
-            info->addr,
-            state->input.bulk_handle,
-            0,
-            state->local_bulk,
-            0,
-            size,
-            HG_OP_ID_IGNORE);
-        if (ret != HG_SUCCESS) {
-            ++rpc_errors_;
-            ++bulk_errors_;
-            cleanup_server_bulk_resources(*state);
-            state->output.status = -1;
-            respond_server_rpc(std::move(state));
-            return HG_SUCCESS;
-        }
-        (void) state.release();
-        return HG_SUCCESS;
-    }
-
-    const auto* bytes = static_cast<const std::uint8_t*>(state->input.eager.data);
-    if (bytes != nullptr && state->input.eager.size > 0) {
-        state->request.assign(bytes, bytes + static_cast<std::size_t>(state->input.eager.size));
-    }
-    cleanup_server_bulk_resources(*state);
-    run_server_handler(std::move(state), &handler_it->second);
-    return HG_SUCCESS;
-#else
-    (void) raw_handle;
-    return 0;
 #endif
 }
 

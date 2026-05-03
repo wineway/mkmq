@@ -2,12 +2,12 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/internal/estimated_histogram.hh>
-#include <seastar/core/timer.hh>
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
-#include <unordered_map>
+#include <string_view>
 #include <vector>
 
 namespace mkmq {
@@ -20,16 +20,23 @@ public:
     MercuryShard();
     ~MercuryShard();
 
+    MercuryShard(const MercuryShard&) = delete;
+    MercuryShard& operator=(const MercuryShard&) = delete;
+    MercuryShard(MercuryShard&&) = delete;
+    MercuryShard& operator=(MercuryShard&&) = delete;
+
     seastar::future<> start(std::string address, bool listen);
     seastar::future<> stop();
     bool running() const noexcept;
 
-    void register_rpc(std::string name, RpcHandler handler);
+    // Hot-path APIs take string_view so callers with pre-owned std::string or
+    // string-literal RPC names never incur a copy across the call boundary.
+    void register_rpc(std::string_view name, RpcHandler handler);
     seastar::future<std::vector<std::uint8_t>> forward(
-        std::string peer,
-        std::string rpc,
+        std::string_view peer,
+        std::string_view rpc,
         std::vector<std::uint8_t> payload);
-    int handle_mercury_rpc(void* handle);
+
     std::uint64_t rpc_forwards() const noexcept;
     std::uint64_t rpc_receives() const noexcept;
     std::uint64_t rpc_errors() const noexcept;
@@ -42,31 +49,8 @@ public:
     seastar::metrics::internal::time_estimated_histogram bulk_latency() const;
 
 private:
-    friend void* mercury_client_cache_raw(MercuryShard* shard) noexcept;
-
-    void arm_progress_timer(bool recently_active = false);
-    bool progress_once();
-    void register_mercury_rpc(const std::string& name);
-
-    bool running_{false};
-    std::string address_;
-    seastar::timer<> progress_timer_;
-    std::unordered_map<std::string, RpcHandler> handlers_;
-    std::unordered_map<std::string, std::uint64_t> rpc_ids_;
-    std::unordered_map<std::uint64_t, std::string> rpc_names_;
-    std::uint64_t rpc_forwards_{0};
-    std::uint64_t rpc_receives_{0};
-    std::uint64_t rpc_errors_{0};
-    std::uint64_t rpc_timeouts_{0};
-    std::uint64_t bulk_transfers_{0};
-    std::uint64_t bulk_bytes_{0};
-    std::uint64_t bulk_errors_{0};
-    seastar::metrics::internal::time_estimated_histogram rpc_forward_latency_;
-    seastar::metrics::internal::time_estimated_histogram rpc_handler_latency_;
-    seastar::metrics::internal::time_estimated_histogram bulk_latency_;
-    void* hg_class_{nullptr};
-    void* hg_context_{nullptr};
-    void* client_cache_{nullptr};
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mkmq
