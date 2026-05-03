@@ -66,6 +66,8 @@ target_link_libraries(mkmq_protocol PUBLIC CRC32C::crc32c)
 
 add_library(mkmq_core
     src/broker_shard.cpp
+    src/broker_shard_detail.cpp
+    src/partition_log_shard.cpp
     src/config.cpp
     src/kafka_protocol.cpp
     src/mercury_shard.cpp)

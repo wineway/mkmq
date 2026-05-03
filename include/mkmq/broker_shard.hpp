@@ -18,9 +18,10 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <map>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mkmq {
@@ -196,6 +197,17 @@ public:
     std::optional<PartitionConfig> partition_config(const std::string& topic, std::int32_t partition) const;
 
 private:
+    // Per-partition slot. `log` is owned via unique_ptr so that:
+    //   (1) PartitionLogShard addresses are stable across `partitions_` vector
+    //       reallocations — every captured `PartitionLogShard*` in an
+    //       in-flight future remains valid, and
+    //   (2) the flat vector stays cache-friendly for iteration without paying
+    //       sizeof(PartitionLogShard) per element move on insert.
+    struct PartitionEntry {
+        TopicPartition key;
+        std::unique_ptr<PartitionLogShard> log;
+    };
+
     seastar::future<> accept_loop();
     seastar::future<> handle_connection(seastar::connected_socket socket);
     void register_metrics();
@@ -210,12 +222,20 @@ private:
         const PartitionConfig& partition,
         const ProducePartitionResult& local_result,
         const std::vector<std::uint8_t>& records);
-    seastar::future<> send_replica_append(std::int32_t broker_id, ReplicaAppendRequest request);
     seastar::future<ReplicaFetchResult> send_replica_fetch(std::int32_t broker_id, ReplicaFetchRequest request);
+
+    // Hot-path partition lookup: O(log n) binary search with a single-slot
+    // pointer cache that skips the search on repeat calls for the same
+    // (topic, partition) — the common HFT steady state. Returns nullptr when
+    // the key is not locally owned.
+    PartitionLogShard* find_partition_log(std::string_view topic, std::int32_t partition) noexcept;
+    const PartitionLogShard* find_partition_log(std::string_view topic, std::int32_t partition) const noexcept;
+    PartitionLogShard& emplace_partition_log(TopicPartition key);
 
     BrokerConfig config_;
     seastar::sharded<BrokerShard>* peers_{nullptr};
-    std::map<TopicPartition, PartitionLogShard> partitions_;
+    std::vector<PartitionEntry> partitions_;  // sorted by key
+    mutable PartitionEntry* hot_partition_{nullptr};
     MercuryShard mercury_;
     KafkaProtocol protocol_;
     bool stopping_{false};
