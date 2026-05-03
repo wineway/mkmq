@@ -48,6 +48,8 @@ seastar::future<> PartitionLogShard::start(
     segment_bytes_ = segment_bytes;
     index_entries_.clear();
     index_write_error_ = nullptr;
+    pending_flush_ = seastar::shared_future<>(seastar::make_ready_future<>());
+    flush_scheduled_ = false;
     return seastar::recursive_touch_directory(root_.string()).then([this] {
         return recover();
     }).then([this] {
@@ -70,7 +72,10 @@ seastar::future<> PartitionLogShard::stop() {
     auto drain = index_write_gate_.is_closed()
         ? seastar::make_ready_future<>()
         : index_write_gate_.close();
-    return drain.then([this] {
+    auto flush_drain = flush_scheduled_
+        ? pending_flush_.get_future().handle_exception([](std::exception_ptr) {})
+        : seastar::make_ready_future<>();
+    return seastar::when_all_succeed(std::move(drain), std::move(flush_drain)).discard_result().then([this] {
         // Drop all cached segment handles. Each shared_ptr's deleter enqueues
         // the close() onto segment_close_gate_, which we drain below.
         segment_cache_.clear();
@@ -535,23 +540,37 @@ seastar::future<> PartitionLogShard::ensure_segment_for_write(std::int64_t base_
     if (write_position_ == 0 || write_position_ + frame_size <= segment_bytes_) {
         return seastar::make_ready_future<>();
     }
-    // Segment rollover. Instead of closing the old rw handle immediately (which
-    // would race with in-flight reads holding a shared aliased copy), hand it
-    // to the segment read cache. Future reads of this now-sealed segment hit
-    // the cache, and close() eventually happens via the shared_ptr deleter
-    // once cache + readers all release.
-    const auto sealed_base = active_segment_base_offset_;
-    auto old_file = std::move(*file_);
-    file_.reset();
-    auto wrapped = seastar::make_lw_shared<CachedSegmentFile>(
-        std::move(old_file), &segment_close_gate_);
-    while (segment_cache_.size() >= kSegmentCacheMax) {
-        segment_cache_.pop_back();
-    }
-    segment_cache_.push_front(SegmentCacheEntry{sealed_base, std::move(wrapped)});
-    active_segment_base_offset_ = base_offset;
-    write_position_ = 0;
-    return open_active_segment();
+    // Segment rollover. Two races to guard against:
+    //   (1) group-commit fsync: pending_flush_ may still be in-flight for
+    //       the outgoing segment. If we seal+swap file_ before it lands, the
+    //       flush would target the NEW segment and the last batch of records
+    //       on the old segment wouldn't reach disk on a crash. Drain first.
+    //   (2) in-flight reads: a concurrent fetch could be holding an aliased
+    //       handle on the active rw file. Instead of closing, hand the old
+    //       handle to the segment read cache — close() fires via the
+    //       shared_ptr deleter once cache + readers all release.
+    auto flush_barrier = flush_scheduled_
+        ? pending_flush_.get_future()
+        : seastar::make_ready_future<>();
+    return flush_barrier.then([this, base_offset] {
+        if (!file_.has_value() || write_position_ == 0) {
+            // Another rolled-over path raced ahead of us — the new segment is
+            // already in place, nothing to do.
+            return seastar::make_ready_future<>();
+        }
+        const auto sealed_base = active_segment_base_offset_;
+        auto old_file = std::move(*file_);
+        file_.reset();
+        auto wrapped = seastar::make_lw_shared<CachedSegmentFile>(
+            std::move(old_file), &segment_close_gate_);
+        while (segment_cache_.size() >= kSegmentCacheMax) {
+            segment_cache_.pop_back();
+        }
+        segment_cache_.push_front(SegmentCacheEntry{sealed_base, std::move(wrapped)});
+        active_segment_base_offset_ = base_offset;
+        write_position_ = 0;
+        return open_active_segment();
+    });
 }
 
 seastar::future<> PartitionLogShard::write_record_set(const RecordSet& record_set) {
@@ -852,15 +871,32 @@ seastar::future<> PartitionLogShard::maybe_flush() {
     if (!file_.has_value()) {
         return seastar::make_exception_future<>(std::runtime_error("partition segment file is not open"));
     }
-    const auto started = std::chrono::steady_clock::now();
-    return file_->flush().then([this, started] {
-            ++disk_fsyncs_;
-            disk_fsync_latency_.add(std::chrono::steady_clock::now() - started);
-            if (index_file_.has_value()) {
-                return index_file_->flush();
-            }
-            return seastar::make_ready_future<>();
-        });
+    // Group-commit fsync: first arrival arms pending_flush_ with a yield so
+    // all appends that finish their dma_write within one reactor tick pile
+    // onto the same flush. Every subsequent caller in that tick returns the
+    // same shared_future. N concurrent fsync demands collapse into 1 real
+    // fdatasync() syscall. Index fsync is intentionally dropped — the index
+    // file is rebuildable from the segment files (see recover_from_segments),
+    // so paying fsync for durability we already have elsewhere is waste.
+    if (!flush_scheduled_) {
+        flush_scheduled_ = true;
+        pending_flush_ = seastar::shared_future<>(
+            seastar::yield().then([this] {
+                // Clear the flag *before* firing the flush so appends arriving
+                // while the flush is in progress arm a fresh pending_flush_
+                // for the next batch.
+                flush_scheduled_ = false;
+                if (!file_.has_value()) {
+                    return seastar::make_ready_future<>();
+                }
+                const auto started = std::chrono::steady_clock::now();
+                return file_->flush().then([this, started] {
+                    ++disk_fsyncs_;
+                    disk_fsync_latency_.add(std::chrono::steady_clock::now() - started);
+                });
+            }));
+    }
+    return pending_flush_.get_future();
 }
 
 std::int64_t PartitionLogShard::estimate_record_count(const std::vector<std::uint8_t>& records) {

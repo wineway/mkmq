@@ -218,6 +218,14 @@ private:
     // are pre-assigned, so there's no ordering requirement).
     seastar::gate index_write_gate_;
     std::exception_ptr index_write_error_;
+    // Group-commit fsync state. `pending_flush_` represents the next fsync
+    // that will land on the current file_ (armed behind a yield()). All
+    // appends that call maybe_flush() within one reactor tick share this
+    // same future so N demands coalesce into 1 real fsync. flush_scheduled_
+    // is cleared when the yield fires (before the actual flush starts), so
+    // subsequent appends arm a fresh pending_flush_ for the next batch.
+    seastar::shared_future<> pending_flush_;
+    bool flush_scheduled_{false};
     std::uint64_t disk_writes_{0};
     std::uint64_t disk_fsyncs_{0};
     LatencyHistogram disk_write_latency_;
